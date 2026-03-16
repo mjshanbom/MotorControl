@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/bin/python3 -m pytest test_scan_gui.py -v)",
+      "Bash(.venv/bin/pip install:*)",
+      "Bash(python3 -m pip install pytest -q)",
+      "Bash(python3 -m pytest \"/Users/matthewshanbom/Desktop/Code Projects/Motor/test_scan_gui.py\" -v)",
+      "Bash(rm -rf .venv)",
+      "Bash(python3 -m venv .venv)",
+      "Bash(/Library/Frameworks/Python.framework/Versions/3.10/bin/python3 -:*)",
+      "Bash(.venv/bin/python analyze_waveform.py \"Waveform-1cycle.txt.txt\")"
+    ]
+  }
+}
