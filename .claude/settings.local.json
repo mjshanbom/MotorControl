@@ -8,7 +8,8 @@
       "Bash(rm -rf .venv)",
       "Bash(python3 -m venv .venv)",
       "Bash(/Library/Frameworks/Python.framework/Versions/3.10/bin/python3 -:*)",
-      "Bash(.venv/bin/python analyze_waveform.py \"Waveform-1cycle.txt.txt\")"
+      "Bash(.venv/bin/python analyze_waveform.py \"Waveform-1cycle.txt.txt\")",
+      "Bash(python analyze_waveform.py 415.txt)"
     ]
   }
 }

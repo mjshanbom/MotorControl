@@ -49,11 +49,18 @@ def load_waveform(path):
     Line 2: timescale (s/div, sign ignored)
     Line 3+: voltage samples (volts)
     """
-    with open(path) as f:
+    with open(path, encoding='latin-1') as f:
         lines = [l.strip() for l in f if l.strip()]
     dt        = float(lines[0])
     timescale = abs(float(lines[1]))
-    voltage   = np.array([float(v) for v in lines[2:]])
+    samples = []
+    for line in lines[2:]:
+        for token in line.split():
+            try:
+                samples.append(float(token))
+            except ValueError:
+                pass
+    voltage = np.array(samples)
     return dt, timescale, voltage
 
 
@@ -63,24 +70,39 @@ def analyze(dt, voltage):
     """Replicate the calculations in scan_gui.capture()."""
     v_ac = voltage - voltage.mean()
 
-    # Frequency via Hanning-windowed zero-padded FFT
-    nfft   = 131072
-    window = np.hanning(len(v_ac))
-    fft_mag = np.abs(np.fft.rfft(v_ac * window, n=nfft))
-    k = int(np.argmax(fft_mag[1:]) + 1)
-    if 1 < k < len(fft_mag) - 1:
-        a, b, c = fft_mag[k - 1], fft_mag[k], fft_mag[k + 1]
-        denom  = a - 2 * b + c
-        k_frac = k + (a - c) / (2 * denom) if denom != 0 else k
+    # Frequency: zero-crossing counter with amplitude threshold
+    threshold = 0.15 * np.max(np.abs(v_ac))
+    raw_crosses = np.where((v_ac[:-1] < 0) & (v_ac[1:] >= 0))[0]
+    crosses = [i for i in raw_crosses
+               if np.max(v_ac[max(0, i - 50):i + 51]) >  threshold
+               and np.min(v_ac[max(0, i - 50):i + 51]) < -threshold]
+    if len(crosses) >= 2:
+        refined = []
+        for i in crosses:
+            frac = -v_ac[i] / (v_ac[i + 1] - v_ac[i])
+            refined.append((i + frac) * dt)
+        periods = np.diff(refined)
+        freq = float(1.0 / np.mean(periods))
     else:
-        k_frac = k
-    freq = float(k_frac / (nfft * dt))
+        # Single-cycle fallback: peak-to-trough half-period.
+        # Robust for arbitrary frequencies; accuracy limited only by sample
+        # resolution, not FFT bin spacing.
+        idx_peak   = int(np.argmax(v_ac))
+        idx_trough = int(np.argmin(v_ac))
+        half_period = abs(idx_peak - idx_trough) * dt
+        freq = float(1.0 / (2 * half_period)) if half_period > 0 else 0.0
 
-    RHO_C = 1.5e6   # acoustic impedance of water (Pa·s/m)
+    RHO_C = 1.54e6  # acoustic impedance of water (Pa·s/m)
 
     cal_factor, cal_freq_mhz = get_cal_factor(freq)
     pii = float(np.sum((v_ac / (cal_factor * 1e-6)) ** 2) * dt) / (RHO_C * 1e4)  # J/cm²
-    pd  = float(len(voltage) * dt)
+
+    # Pulse duration: 10–90% cumulative energy × 1.25 correction factor
+    cumulative = np.cumsum(v_ac ** 2) * dt
+    total_energy = cumulative[-1]
+    t1 = int(np.searchsorted(cumulative, 0.10 * total_energy)) * dt
+    t2 = int(np.searchsorted(cumulative, 0.90 * total_energy)) * dt
+    pd = float((t2 - t1) * 1.25)
 
     return {
         "n_samples":      len(voltage),

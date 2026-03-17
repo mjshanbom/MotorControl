@@ -59,7 +59,7 @@ def setup_scope(scope, channel, ac_coupling=False):
     scope.write(":WAV:MODE NORM")
     scope.write(":WAV:FORM BYTE")
     scope.write(":WAV:STAR 1")
-    scope.write(":WAV:STOP 1020")
+    scope.write(":WAV:STOP 1200")
     preamble    = scope.query(":WAV:PRE?").strip().split(",")
     return {
         "n_points":    int(preamble[2]),
@@ -118,7 +118,8 @@ def capture(scope, pre, stop_event=None):
     threshold = 0.15 * np.max(np.abs(v_ac))
     raw_crosses = np.where((v_ac[:-1] < 0) & (v_ac[1:] >= 0))[0]
     crosses = [i for i in raw_crosses
-               if np.max(np.abs(v_ac[max(0, i - 5):i + 6])) > threshold]
+               if np.max(v_ac[max(0, i - 50):i + 51]) >  threshold
+               and np.min(v_ac[max(0, i - 50):i + 51]) < -threshold]
     if len(crosses) >= 2:
         # linear interpolation for sub-sample accuracy on each crossing
         refined = []
@@ -128,24 +129,26 @@ def capture(scope, pre, stop_event=None):
         periods = np.diff(refined)
         freq = float(1.0 / np.mean(periods))
     else:
-        nfft    = 131072
-        window  = np.hanning(len(v_ac))
-        fft_mag = np.abs(np.fft.rfft(v_ac * window, n=nfft))
-        k = int(np.argmax(fft_mag[1:]) + 1)
-        if 1 < k < len(fft_mag) - 1:
-            a, b, c = fft_mag[k - 1], fft_mag[k], fft_mag[k + 1]
-            denom   = a - 2 * b + c
-            k_frac  = k + (a - c) / (2 * denom) if denom != 0 else k
-        else:
-            k_frac = k
-        freq = float(k_frac / (nfft * dt))
+        # Single-cycle fallback: peak-to-trough half-period.
+        # Robust for arbitrary frequencies; accuracy limited only by sample
+        # resolution, not FFT bin spacing.
+        idx_peak   = int(np.argmax(v_ac))
+        idx_trough = int(np.argmin(v_ac))
+        half_period = abs(idx_peak - idx_trough) * dt
+        freq = float(1.0 / (2 * half_period)) if half_period > 0 else 0.0
 
     freq_mhz = freq / 1e6
     cal_idx    = int(np.argmin(np.abs(_CAL_FREQS - freq_mhz)))
     cal_factor = _CAL_FACTORS[cal_idx]
-    RHO_C      = 1.5e6  # acoustic impedance of water (Pa·s/m)
+    RHO_C      = 1.54e6  # acoustic impedance of water (Pa·s/m)
     pii = float(np.sum((v_ac / (cal_factor * 1e-6))**2) * dt) / (RHO_C * 1e4)  # J/cm²
-    pd  = float(len(voltage) * dt)              # s     (capture window duration)
+
+    # Pulse duration: 10–90% cumulative energy × 1.25 correction factor
+    cumulative = np.cumsum(v_ac ** 2) * dt
+    total_energy = cumulative[-1]
+    t1 = int(np.searchsorted(cumulative, 0.10 * total_energy)) * dt
+    t2 = int(np.searchsorted(cumulative, 0.90 * total_energy)) * dt
+    pd = float((t2 - t1) * 1.25)
 
     return {
         "n_samples":  len(voltage),
