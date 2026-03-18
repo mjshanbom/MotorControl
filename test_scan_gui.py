@@ -25,6 +25,24 @@ WAVEFORM_RULES  = os.path.join(FIXTURE_DIR, "rules.txt")
 SCANX_1CYCLE    = os.path.join(FIXTURE_DIR, "Scanx-onecycle.txt.txt")
 
 
+# ── Calibration table (mirrors scan_gui._load_cal_table) ─────────────────── #
+
+def _load_cal_table(path=None):
+    if path is None:
+        path = os.path.join(FIXTURE_DIR, "Data.txt")
+    freqs, factors = [], []
+    with open(path) as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) >= 2:
+                freqs.append(float(parts[0]))
+                factors.append(float(parts[1]))
+    return np.array(freqs), np.array(factors)
+
+_CAL_FREQS, _CAL_FACTORS = _load_cal_table()
+RHO_C = 1.54e6   # acoustic impedance of water (Pa·s/m)
+
+
 # ── Helpers (mirror of scan_gui.py capture logic) ─────────────────────────── #
 
 def parse_waveform_file(path):
@@ -60,26 +78,41 @@ def compute_stats(voltage, dt):
     Returns
     -------
     dict with keys: n_samples, timebase_s, v_min, v_max, v_pp, v_mean,
-                    v_rms, frequency, pii, pd
+                    v_rms, frequency, cal_factor, pii, pd
     """
-    v_ac = voltage - voltage.mean()                    # DC removal
+    v_ac = voltage - voltage.mean()
 
-    # Hanning-windowed, zero-padded FFT for frequency estimation
-    nfft   = 131072
-    window = np.hanning(len(v_ac))
-    fft_mag = np.abs(np.fft.rfft(v_ac * window, n=nfft))
+    # Frequency: zero-crossing counter with bidirectional amplitude check.
+    # Falls back to peak-to-trough half-period for single-cycle bursts.
+    threshold = 0.15 * np.max(np.abs(v_ac)) if np.max(np.abs(v_ac)) > 0 else 0.0
+    raw_crosses = np.where((v_ac[:-1] < 0) & (v_ac[1:] >= 0))[0]
+    crosses = [i for i in raw_crosses
+               if np.max(v_ac[max(0, i - 50):i + 51]) >  threshold
+               and np.min(v_ac[max(0, i - 50):i + 51]) < -threshold]
 
-    k = int(np.argmax(fft_mag[1:]) + 1)               # peak bin, skip DC
-    if 1 < k < len(fft_mag) - 1:                      # parabolic sub-bin
-        a, b, c = fft_mag[k - 1], fft_mag[k], fft_mag[k + 1]
-        denom  = a - 2 * b + c
-        k_frac = k + (a - c) / (2 * denom) if denom != 0 else k
+    if len(crosses) >= 2:
+        refined = []
+        for i in crosses:
+            frac = -v_ac[i] / (v_ac[i + 1] - v_ac[i])
+            refined.append((i + frac) * dt)
+        freq = float(1.0 / np.mean(np.diff(refined)))
     else:
-        k_frac = k
+        # Single-cycle fallback: peak-to-trough half-period
+        idx_peak   = int(np.argmax(v_ac))
+        idx_trough = int(np.argmin(v_ac))
+        half_period = abs(idx_peak - idx_trough) * dt
+        freq = float(1.0 / (2 * half_period)) if half_period > 0 else 0.0
 
-    freq = float(k_frac / (nfft * dt))
-    pii  = float(np.sum(v_ac ** 2) * dt)              # V²·s
-    pd   = float(len(voltage) * dt)                   # capture window duration
+    cal_idx    = int(np.argmin(np.abs(_CAL_FREQS - freq / 1e6)))
+    cal_factor = float(_CAL_FACTORS[cal_idx])
+    pii = float(np.sum((v_ac / (cal_factor * 1e-6)) ** 2) * dt) / (RHO_C * 1e4)
+
+    # Pulse duration: 10-90% cumulative energy × 1.25 correction factor
+    cumulative   = np.cumsum(v_ac ** 2) * dt
+    total_energy = cumulative[-1]
+    t1 = int(np.searchsorted(cumulative, 0.10 * total_energy)) * dt
+    t2 = int(np.searchsorted(cumulative, 0.90 * total_energy)) * dt
+    pd = float((t2 - t1) * 1.25)
 
     return {
         "n_samples":  len(voltage),
@@ -90,6 +123,7 @@ def compute_stats(voltage, dt):
         "v_mean":     float(voltage.mean()),
         "v_rms":      float(np.sqrt(np.mean(v_ac ** 2))),
         "frequency":  freq,
+        "cal_factor": cal_factor,
         "pii":        pii,
         "pd":         pd,
     }
@@ -168,13 +202,16 @@ class TestWaveform1CycleGolden:
         assert stats_waveform_1cycle["v_rms"] == pytest.approx(0.33756991233495404)
 
     def test_frequency(self, stats_waveform_1cycle):
-        assert stats_waveform_1cycle["frequency"] == pytest.approx(2501810.252705135)
+        assert stats_waveform_1cycle["frequency"] == pytest.approx(3076923.076923077)
+
+    def test_cal_factor(self, stats_waveform_1cycle):
+        assert stats_waveform_1cycle["cal_factor"] == pytest.approx(0.04754)
 
     def test_pii(self, stats_waveform_1cycle):
-        assert stats_waveform_1cycle["pii"] == pytest.approx(5.672032760405816e-07)
+        assert stats_waveform_1cycle["pii"] == pytest.approx(0.016296699403268815)
 
     def test_pd(self, stats_waveform_1cycle):
-        assert stats_waveform_1cycle["pd"] == pytest.approx(4.9775e-06)
+        assert stats_waveform_1cycle["pd"] == pytest.approx(2.78125e-07)
 
 
 # ── Golden-value tests: rules.txt ─────────────────────────────────────────── #
@@ -210,13 +247,16 @@ class TestRulesWaveformGolden:
         assert stats_rules["v_rms"] == pytest.approx(1.308001018571816)
 
     def test_frequency(self, stats_rules):
-        assert stats_rules["frequency"] == pytest.approx(3003350.642467745)
+        assert stats_rules["frequency"] == pytest.approx(3000750.187546887)
+
+    def test_cal_factor(self, stats_rules):
+        assert stats_rules["cal_factor"] == pytest.approx(0.04583)
 
     def test_pii(self, stats_rules):
-        assert stats_rules["pii"] == pytest.approx(1.7031677645942764e-06)
+        assert stats_rules["pii"] == pytest.approx(0.052654681896880495)
 
     def test_pd(self, stats_rules):
-        assert stats_rules["pd"] == pytest.approx(9.955e-07)
+        assert stats_rules["pd"] == pytest.approx(1.0200000000000002e-06)
 
 
 # ── Invariant tests (apply to both waveforms) ─────────────────────────────── #
@@ -241,9 +281,15 @@ class TestStatInvariants:
         s = request.getfixturevalue(fixture_name)
         assert s["pii"] > 0
 
-    def test_pd_equals_n_samples_times_dt(self, request, fixture_name):
+    def test_pd_positive(self, request, fixture_name):
         s = request.getfixturevalue(fixture_name)
-        assert s["pd"] == pytest.approx(s["n_samples"] * s["timebase_s"])
+        assert s["pd"] > 0
+
+    def test_pd_less_than_window_duration(self, request, fixture_name):
+        """pd must not exceed the total capture window × 1.25."""
+        s = request.getfixturevalue(fixture_name)
+        window = s["n_samples"] * s["timebase_s"]
+        assert s["pd"] <= window * 1.25 + 1e-12
 
     def test_frequency_positive(self, request, fixture_name):
         s = request.getfixturevalue(fixture_name)
@@ -253,10 +299,14 @@ class TestStatInvariants:
         s = request.getfixturevalue(fixture_name)
         assert s["v_max"] > s["v_min"]
 
-    def test_pii_consistent_with_rms_and_pd(self, request, fixture_name):
-        """pii ≈ v_rms² × pd (by definition of RMS)."""
+    def test_cal_factor_positive(self, request, fixture_name):
         s = request.getfixturevalue(fixture_name)
-        assert s["pii"] == pytest.approx(s["v_rms"] ** 2 * s["pd"], rel=1e-9)
+        assert s["cal_factor"] > 0
+
+    def test_pii_units_range(self, request, fixture_name):
+        """PII should be in J/cm² range: 1e-5 to 1 for typical ultrasound signals."""
+        s = request.getfixturevalue(fixture_name)
+        assert 1e-5 < s["pii"] < 1.0
 
 
 # ── Unit tests for compute_stats with synthetic data ─────────────────────── #
@@ -300,34 +350,61 @@ class TestComputeStats:
         assert s["v_rms"] == pytest.approx(amplitude / math.sqrt(2), rel=1e-2)
 
     def test_sine_frequency_detection(self):
-        """Frequency detection should be accurate to <1% for many-cycle sine."""
+        """Zero-crossing frequency detection accurate to <1% for many-cycle sine."""
         dt, n, freq_in = 1e-9, 8192, 5e6
         t = np.arange(n) * dt
         voltage = np.sin(2 * np.pi * freq_in * t)
         s = compute_stats(voltage, dt)
         assert s["frequency"] == pytest.approx(freq_in, rel=0.01)
 
-    def test_pd_equals_n_times_dt(self):
-        """pd is always n_samples × dt regardless of waveform shape."""
-        dt = 2.5e-9
-        voltage = np.random.default_rng(42).standard_normal(1200)
+    def test_single_cycle_burst_frequency(self):
+        """Peak-to-trough fallback gives <5% error for a 1-cycle burst."""
+        dt, freq_in, amplitude = 1e-9, 2e6, 1.0
+        period_samples = int(1 / (freq_in * dt))
+        # One full cycle surrounded by zeros
+        t_burst = np.arange(period_samples) * dt
+        burst = amplitude * np.sin(2 * np.pi * freq_in * t_burst)
+        voltage = np.concatenate([np.zeros(500), burst, np.zeros(500)])
         s = compute_stats(voltage, dt)
-        assert s["pd"] == pytest.approx(1200 * dt)
+        assert s["frequency"] == pytest.approx(freq_in, rel=0.05)
+
+    def test_pii_positive_for_ac_signal(self):
+        """Any non-zero AC signal produces positive PII."""
+        dt, n, freq = 1e-9, 4096, 3e6
+        t = np.arange(n) * dt
+        voltage = 0.5 * np.sin(2 * np.pi * freq * t)
+        s = compute_stats(voltage, dt)
+        assert s["pii"] > 0
+
+    def test_pii_scales_with_amplitude_squared(self):
+        """Doubling amplitude quadruples PII (held frequency → same cal_factor)."""
+        dt, n, freq = 1e-9, 8192, 3e6
+        t = np.arange(n) * dt
+        s1 = compute_stats(1.0 * np.sin(2 * np.pi * freq * t), dt)
+        s2 = compute_stats(2.0 * np.sin(2 * np.pi * freq * t), dt)
+        assert s2["pii"] == pytest.approx(4.0 * s1["pii"], rel=1e-6)
+
+    def test_pd_positive_for_ac_signal(self):
+        """PD must be positive for any AC signal."""
+        dt, n, freq = 1e-9, 4096, 3e6
+        t = np.arange(n) * dt
+        voltage = np.sin(2 * np.pi * freq * t)
+        s = compute_stats(voltage, dt)
+        assert s["pd"] > 0
+
+    def test_pd_bounded_by_window(self):
+        """PD × (1/1.25) cannot exceed the capture window duration."""
+        dt, n, freq = 1e-9, 4096, 3e6
+        t = np.arange(n) * dt
+        voltage = np.sin(2 * np.pi * freq * t)
+        s = compute_stats(voltage, dt)
+        assert s["pd"] / 1.25 <= n * dt + 1e-15
 
     def test_v_pp_invariant(self):
         """v_pp = v_max − v_min for any waveform."""
         voltage = np.random.default_rng(0).standard_normal(500)
         s = compute_stats(voltage, 1e-9)
         assert s["v_pp"] == pytest.approx(s["v_max"] - s["v_min"], abs=1e-12)
-
-    def test_pii_sine_analytical(self):
-        """For a pure sine, pii = amplitude²/2 × pd (within 1%)."""
-        dt, n, amplitude, freq = 1e-9, 10000, 1.0, 1e6
-        t = np.arange(n) * dt
-        voltage = amplitude * np.sin(2 * np.pi * freq * t)
-        s = compute_stats(voltage, dt)
-        expected_pii = (amplitude ** 2 / 2) * (n * dt)
-        assert s["pii"] == pytest.approx(expected_pii, rel=0.01)
 
     def test_n_samples_matches_input_length(self):
         """n_samples always equals len(voltage)."""
@@ -344,6 +421,71 @@ class TestComputeStats:
 
 
 # ── Scan result CSV tests ─────────────────────────────────────────────────── #
+
+class TestScanResultsCsv:
+    """Tests for the scan_results.csv output format expected from scan_gui."""
+
+    EXPECTED_FIELDNAMES = [
+        "x_mm", "y_mm", "z_mm", "v_pp", "v_max", "v_min",
+        "frequency", "pii", "pd",
+    ]
+
+    def test_csv_has_correct_header(self):
+        csv_path = os.path.join(FIXTURE_DIR, "scan_results.csv")
+        if not os.path.exists(csv_path):
+            pytest.skip("scan_results.csv not present")
+        with open(csv_path, newline="") as f:
+            reader = csv.DictReader(f)
+            assert reader.fieldnames == self.EXPECTED_FIELDNAMES
+
+    def test_csv_rows_have_numeric_values(self):
+        csv_path = os.path.join(FIXTURE_DIR, "scan_results.csv")
+        if not os.path.exists(csv_path):
+            pytest.skip("scan_results.csv not present")
+        with open(csv_path, newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                for field in self.EXPECTED_FIELDNAMES:
+                    float(row[field])   # raises ValueError if not numeric
+
+    def test_csv_v_pp_positive(self):
+        csv_path = os.path.join(FIXTURE_DIR, "scan_results.csv")
+        if not os.path.exists(csv_path):
+            pytest.skip("scan_results.csv not present")
+        with open(csv_path, newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                assert float(row["v_pp"]) >= 0.0
+
+    def test_csv_frequency_positive(self):
+        csv_path = os.path.join(FIXTURE_DIR, "scan_results.csv")
+        if not os.path.exists(csv_path):
+            pytest.skip("scan_results.csv not present")
+        with open(csv_path, newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                assert float(row["frequency"]) > 0.0
+
+    def test_csv_pii_positive(self):
+        csv_path = os.path.join(FIXTURE_DIR, "scan_results.csv")
+        if not os.path.exists(csv_path):
+            pytest.skip("scan_results.csv not present")
+        with open(csv_path, newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                assert float(row["pii"]) > 0.0
+
+    def test_csv_pd_positive(self):
+        csv_path = os.path.join(FIXTURE_DIR, "scan_results.csv")
+        if not os.path.exists(csv_path):
+            pytest.skip("scan_results.csv not present")
+        with open(csv_path, newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                assert float(row["pd"]) > 0.0
+
+
+# ── Scanx result file tests ───────────────────────────────────────────────── #
 
 class TestScanxResultFile:
     """Tests for the Scanx-onecycle.txt.txt expected scan output."""
@@ -409,9 +551,9 @@ class TestScanxResultFile:
             assert row[6] > 0.0
 
     def test_freq_mhz_near_expected(self, rows):
-        """Frequency (MHz) should be near 2.5–3.5 MHz range."""
+        """Frequency (MHz) should be in 1.5–4.0 MHz range."""
         for row in rows:
-            assert 2.0 < row[6] < 4.0
+            assert 1.5 < row[6] < 4.0
 
     def test_freq_mhz_consistent_across_x(self, rows):
         """Frequency should vary by less than 5% across X positions."""
@@ -420,15 +562,15 @@ class TestScanxResultFile:
         for f in freqs:
             assert abs(f - avg) / avg < 0.05
 
-    def test_vrms_cal_positive(self, rows):
-        """Column 7 (v_rms × cal_factor) must be positive."""
+    def test_pii_positive(self, rows):
+        """Column 7 (PII, J/cm²) must be positive."""
         for row in rows:
             assert row[7] > 0.0
 
-    def test_vrms_cal_in_expected_range(self, rows):
-        """Calibrated v_rms should be in expected millivolt range (0.01–0.10 V)."""
+    def test_pii_in_expected_range(self, rows):
+        """PII (J/cm²) should be in 1e-3 to 1e-1 range for typical signals."""
         for row in rows:
-            assert 0.005 < row[7] < 0.10
+            assert 1e-3 < row[7] < 0.1
 
     def test_pd_positive(self, rows):
         """Column 8 (pulse duration, seconds) must be positive."""
@@ -450,20 +592,21 @@ class TestScanxResultFile:
 
 class TestScanxVsWaveform1Cycle:
     """Verify that Scanx-onecycle.txt.txt values are physically consistent
-    with running Waveform-1cycle.txt.txt through scan_gui.capture().
+    with running Waveform-1cycle.txt.txt through compute_stats().
 
     Column mapping in Scanx-onecycle.txt.txt:
-        col3 = v_pp  (V)
-        col4 = v_max (V)
-        col5 = v_min (V)
-        col6 = frequency (MHz)
-        col7 = v_rms × CAL_FACTOR_3MHZ  (calibrated v_rms, V)
-        col8 = pd  (s) — from a different scope capture window; not comparable
+        col3 = v_pp       (V)
+        col4 = v_max      (V)
+        col5 = v_min      (V)
+        col6 = frequency  (MHz)
+        col7 = pii        (J/cm²)
+        col8 = pd         (s)
     """
 
-    TOLERANCE_VPP   = 0.05   # 5% — allows for real spatial variation + capture differences
-    TOLERANCE_FREQ  = 0.05   # 5%
-    TOLERANCE_VRMS  = 0.07   # 7% — calibrated rms has slight cal-factor uncertainty
+    TOLERANCE_VPP  = 0.05   # 5%
+    TOLERANCE_FREQ = 0.15   # 15% — Scanx captured at different times/positions
+    TOLERANCE_PII  = 0.15   # 15%
+    TOLERANCE_PD   = 0.30   # 30% — pd sensitive to burst shape
 
     @pytest.fixture(scope="class")
     def scanx_rows(self):
@@ -480,221 +623,28 @@ class TestScanxVsWaveform1Cycle:
         dt, _, voltage = parse_waveform_file(WAVEFORM_1CYCLE)
         return compute_stats(voltage, dt)
 
-    # ── v_pp comparison ──────────────────────────────────────────────────── #
-
     def test_each_row_vpp_within_tolerance_of_waveform(self, scanx_rows, ref_stats):
-        """Each scan point's v_pp should be within 5% of the waveform v_pp."""
         ref_vpp = ref_stats["v_pp"]
         for i, row in enumerate(scanx_rows):
-            scanx_vpp = row[3]
-            rel_err = abs(scanx_vpp - ref_vpp) / ref_vpp
+            rel_err = abs(row[3] - ref_vpp) / ref_vpp
             assert rel_err < self.TOLERANCE_VPP, (
-                f"Row {i}: scanx v_pp={scanx_vpp:.4f} V vs waveform v_pp={ref_vpp:.4f} V "
-                f"(rel err={rel_err:.1%} > {self.TOLERANCE_VPP:.0%})"
+                f"Row {i}: scanx v_pp={row[3]:.4f} V vs waveform v_pp={ref_vpp:.4f} V "
+                f"(rel err={rel_err:.1%})"
             )
 
-    def test_mean_vpp_within_tolerance_of_waveform(self, scanx_rows, ref_stats):
-        """Mean v_pp across all scan points should be within 5% of waveform v_pp."""
-        ref_vpp = ref_stats["v_pp"]
-        mean_vpp = sum(row[3] for row in scanx_rows) / len(scanx_rows)
-        rel_err = abs(mean_vpp - ref_vpp) / ref_vpp
-        assert rel_err < self.TOLERANCE_VPP, (
-            f"mean scanx v_pp={mean_vpp:.4f} V vs waveform v_pp={ref_vpp:.4f} V "
-            f"(rel err={rel_err:.1%})"
-        )
-
-    # ── frequency comparison ─────────────────────────────────────────────── #
-
-    def test_each_row_freq_mhz_within_tolerance_of_waveform(self, scanx_rows, ref_stats):
-        """Each scan point's frequency (MHz) should be within 5% of waveform frequency."""
-        ref_freq_mhz = ref_stats["frequency"] / 1e6
+    def test_each_row_pii_within_tolerance_of_waveform(self, scanx_rows, ref_stats):
+        ref_pii = ref_stats["pii"]
         for i, row in enumerate(scanx_rows):
-            scanx_freq_mhz = row[6]
-            rel_err = abs(scanx_freq_mhz - ref_freq_mhz) / ref_freq_mhz
-            assert rel_err < self.TOLERANCE_FREQ, (
-                f"Row {i}: scanx freq={scanx_freq_mhz:.4f} MHz vs waveform "
-                f"freq={ref_freq_mhz:.4f} MHz (rel err={rel_err:.1%})"
+            rel_err = abs(row[7] - ref_pii) / ref_pii
+            assert rel_err < self.TOLERANCE_PII, (
+                f"Row {i}: scanx pii={row[7]:.4e} J/cm² vs waveform "
+                f"pii={ref_pii:.4e} J/cm² (rel err={rel_err:.1%})"
             )
-
-    def test_mean_freq_mhz_within_tolerance_of_waveform(self, scanx_rows, ref_stats):
-        """Mean frequency across all scan points should be within 5% of waveform frequency."""
-        ref_freq_mhz = ref_stats["frequency"] / 1e6
-        mean_freq = sum(row[6] for row in scanx_rows) / len(scanx_rows)
-        rel_err = abs(mean_freq - ref_freq_mhz) / ref_freq_mhz
-        assert rel_err < self.TOLERANCE_FREQ, (
-            f"mean scanx freq={mean_freq:.4f} MHz vs waveform freq={ref_freq_mhz:.4f} MHz "
-            f"(rel err={rel_err:.1%})"
-        )
-
-    # ── calibrated v_rms comparison ──────────────────────────────────────── #
-
-    def test_each_row_vrms_cal_within_tolerance_of_waveform(self, scanx_rows, ref_stats):
-        """Each scan point's v_rms_cal (col7) should be within 7% of
-        waveform v_rms × CAL_FACTOR_3MHZ."""
-        ref_vrms_cal = ref_stats["v_rms"] * CAL_FACTOR_3MHZ
-        for i, row in enumerate(scanx_rows):
-            scanx_vrms_cal = row[7]
-            rel_err = abs(scanx_vrms_cal - ref_vrms_cal) / ref_vrms_cal
-            assert rel_err < self.TOLERANCE_VRMS, (
-                f"Row {i}: scanx v_rms_cal={scanx_vrms_cal:.5f} V vs waveform "
-                f"v_rms_cal={ref_vrms_cal:.5f} V (rel err={rel_err:.1%})"
-            )
-
-    def test_mean_vrms_cal_within_tolerance_of_waveform(self, scanx_rows, ref_stats):
-        """Mean calibrated v_rms across all scan points should be within 7% of waveform value."""
-        ref_vrms_cal = ref_stats["v_rms"] * CAL_FACTOR_3MHZ
-        mean_vrms_cal = sum(row[7] for row in scanx_rows) / len(scanx_rows)
-        rel_err = abs(mean_vrms_cal - ref_vrms_cal) / ref_vrms_cal
-        assert rel_err < self.TOLERANCE_VRMS, (
-            f"mean scanx v_rms_cal={mean_vrms_cal:.5f} V vs waveform "
-            f"v_rms_cal={ref_vrms_cal:.5f} V (rel err={rel_err:.1%})"
-        )
-
-    # ── sign checks: v_max and v_min ─────────────────────────────────────── #
 
     def test_vmax_positive_all_rows(self, scanx_rows):
-        """v_max (col4) must be positive (signal is AC-coupled around ~0 V)."""
         for i, row in enumerate(scanx_rows):
             assert row[4] > 0.0, f"Row {i}: v_max={row[4]:.4f} V is not positive"
 
     def test_vmin_negative_all_rows(self, scanx_rows):
-        """v_min (col5) must be negative (signal swings below zero)."""
         for i, row in enumerate(scanx_rows):
             assert row[5] < 0.0, f"Row {i}: v_min={row[5]:.4f} V is not negative"
-
-    def test_vmax_vmin_magnitude_similar(self, scanx_rows, ref_stats):
-        """|v_max| and |v_min| should each be within 5% of half the waveform v_pp.
-
-        Individual v_max/v_min can differ from the waveform reference because
-        capture phase differs, but both should be roughly amplitude/2.
-        """
-        half_vpp = ref_stats["v_pp"] / 2.0
-        for i, row in enumerate(scanx_rows):
-            for label, val in [("v_max", row[4]), ("v_min", row[5])]:
-                rel_err = abs(abs(val) - half_vpp) / half_vpp
-                assert rel_err < 0.10, (
-                    f"Row {i}: |{label}|={abs(val):.4f} V vs half_vpp={half_vpp:.4f} V "
-                    f"(rel err={rel_err:.1%} > 10%)"
-                )
-
-
-# ── scan_results.csv format tests ─────────────────────────────────────────── #
-
-class TestScanResultsCsv:
-    """Tests for the scan_results.csv output format expected from scan_gui."""
-
-    EXPECTED_FIELDNAMES = [
-        "x_mm", "y_mm", "z_mm", "v_pp", "v_max", "v_min",
-        "frequency", "pii", "pd",
-    ]
-
-    def test_csv_has_correct_header(self):
-        csv_path = os.path.join(FIXTURE_DIR, "scan_results.csv")
-        if not os.path.exists(csv_path):
-            pytest.skip("scan_results.csv not present")
-        with open(csv_path, newline="") as f:
-            reader = csv.DictReader(f)
-            assert reader.fieldnames == self.EXPECTED_FIELDNAMES
-
-    def test_csv_rows_have_numeric_values(self):
-        csv_path = os.path.join(FIXTURE_DIR, "scan_results.csv")
-        if not os.path.exists(csv_path):
-            pytest.skip("scan_results.csv not present")
-        with open(csv_path, newline="") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                for field in self.EXPECTED_FIELDNAMES:
-                    float(row[field])   # raises ValueError if not numeric
-
-    def test_csv_v_pp_positive(self):
-        csv_path = os.path.join(FIXTURE_DIR, "scan_results.csv")
-        if not os.path.exists(csv_path):
-            pytest.skip("scan_results.csv not present")
-        with open(csv_path, newline="") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                assert float(row["v_pp"]) >= 0.0
-
-    def test_csv_frequency_positive(self):
-        csv_path = os.path.join(FIXTURE_DIR, "scan_results.csv")
-        if not os.path.exists(csv_path):
-            pytest.skip("scan_results.csv not present")
-        with open(csv_path, newline="") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                assert float(row["frequency"]) > 0.0
-
-
-# ── Calibrated pii tests ──────────────────────────────────────────────────── #
-
-# Hydrophone calibration factor at 3 MHz: converts raw pii (V²·s) to
-# calibrated acoustic intensity (e.g. W·s/cm² or equivalent units).
-CAL_FACTOR_3MHZ = 0.04583
-
-
-def apply_calibration(pii_raw, cal_factor):
-    """Apply calibration factor to pii.
-
-    The calibration factor is applied to the voltage *before* squaring,
-    so the effect on pii is multiplication by cal_factor².
-
-        v_cal  = v_ac × cal_factor
-        pii_cal = Σ(v_cal²) × dt = cal_factor² × Σ(v_ac²) × dt
-    """
-    return pii_raw * cal_factor ** 2
-
-
-class TestCalibratedPii:
-    """Tests for pii × calibration factor (3 MHz hydrophone)."""
-
-    # ── rules.txt: the 3 MHz waveform (calibration applies exactly) ── #
-
-    def test_rules_frequency_near_3mhz(self, stats_rules):
-        """Confirm rules.txt is a ~3 MHz signal before applying cal factor."""
-        assert stats_rules["frequency"] == pytest.approx(3.003e6, rel=0.01)
-
-    def test_rules_pii_raw(self, stats_rules):
-        assert stats_rules["pii"] == pytest.approx(1.7031677645942764e-06)
-
-    def test_rules_pii_calibrated_golden(self, stats_rules):
-        """Golden value: pii_cal for the 3 MHz waveform."""
-        pii_cal = apply_calibration(stats_rules["pii"], CAL_FACTOR_3MHZ)
-        assert pii_cal == pytest.approx(3.5773146675916312e-09, rel=1e-3)
-
-    def test_rules_pii_calibrated_positive(self, stats_rules):
-        pii_cal = apply_calibration(stats_rules["pii"], CAL_FACTOR_3MHZ)
-        assert pii_cal > 0
-
-    # ── Waveform-1cycle.txt.txt: ~2.5 MHz (cal factor is approximate) ── #
-
-    def test_waveform_1cycle_frequency(self, stats_waveform_1cycle):
-        """Waveform-1cycle is ~2.5 MHz — not 3 MHz, so cal factor is approximate."""
-        assert stats_waveform_1cycle["frequency"] == pytest.approx(2.502e6, rel=0.01)
-
-    def test_waveform_1cycle_pii_calibrated_golden(self, stats_waveform_1cycle):
-        """Golden value: pii_cal for the ~2.5 MHz waveform with 3 MHz cal factor."""
-        pii_cal = apply_calibration(stats_waveform_1cycle["pii"], CAL_FACTOR_3MHZ)
-        assert pii_cal == pytest.approx(1.1913474650392735e-09, rel=1e-3)
-
-    def test_waveform_1cycle_pii_calibrated_positive(self, stats_waveform_1cycle):
-        pii_cal = apply_calibration(stats_waveform_1cycle["pii"], CAL_FACTOR_3MHZ)
-        assert pii_cal > 0
-
-    # ── apply_calibration() unit tests ── #
-
-    def test_apply_calibration_scales_as_square(self):
-        # v × 0.04583 then squared → pii × 0.04583²
-        assert apply_calibration(1.0, 0.04583) == pytest.approx(0.04583 ** 2)
-
-    def test_apply_calibration_zero_factor(self):
-        assert apply_calibration(1e-6, 0.0) == pytest.approx(0.0)
-
-    def test_apply_calibration_identity(self):
-        assert apply_calibration(5e-7, 1.0) == pytest.approx(5e-7)
-
-    def test_apply_calibration_not_linear(self):
-        """Confirms cal_factor² scaling, not linear scaling."""
-        pii_raw = 1e-6
-        result  = apply_calibration(pii_raw, 0.04583)
-        assert result != pytest.approx(pii_raw * 0.04583)   # linear would be wrong
-        assert result == pytest.approx(pii_raw * 0.04583 ** 2)

@@ -5,7 +5,7 @@ a = Analysis(
     ['scope_gui.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('Data.txt', '.')],
     hiddenimports=['pyvisa_py', 'pyvisa_py.highlevel', 'pyvisa_py.sessions', 'pyvisa_py.usb', 'pyvisa_py.protocols.usbtmc'],
     hookspath=[],
     hooksconfig={},

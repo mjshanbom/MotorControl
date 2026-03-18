@@ -11,6 +11,7 @@ from tkinter import filedialog, scrolledtext, ttk
 
 import numpy as np
 import pyvisa
+import serial.tools.list_ports
 
 
 # ── Calibration table (Data.txt: freq_MHz, cal_factor) ───────────────────── #
@@ -325,7 +326,11 @@ class ScanApp(tk.Tk):
         conn.grid(row=0, column=0, columnspan=2, sticky="ew", **pad)
 
         self._port = self._row(conn, 0, "Motor port",  "/dev/tty.usbserial-FTEHI1FO")
+        ttk.Button(conn, text="Find", command=self._find_port).grid(
+            row=0, column=2, padx=(0, 8), pady=2, sticky="w")
         self._visa = self._row(conn, 1, "Scope VISA",  "USB0::6833::1303::DS1ZE278M01562::0::INSTR")
+        ttk.Button(conn, text="Find", command=self._find_visa).grid(
+            row=1, column=2, padx=(0, 8), pady=2, sticky="w")
         self._chan = self._row(conn, 2, "Channel",     "CHAN1")
 
         self._ac_var = tk.BooleanVar(value=True)
@@ -448,6 +453,62 @@ class ScanApp(tk.Tk):
         self._start_btn.pack(side="left", padx=6)
         self._stop_btn  = ttk.Button(btn, text="Stop", command=self._stop, state="disabled")
         self._stop_btn.pack(side="left", padx=6)
+
+    def _find_port(self):
+        """List available serial ports and let the user pick one."""
+        ports = [p.device for p in serial.tools.list_ports.comports()]
+        if not ports:
+            tk.messagebox.showinfo("Find Ports", "No serial ports found.")
+            return
+
+        dlg = tk.Toplevel(self)
+        dlg.title("Select Serial Port")
+        dlg.resizable(False, False)
+        ttk.Label(dlg, text="Select a port:").pack(padx=12, pady=(10, 4))
+        lb = tk.Listbox(dlg, listvariable=tk.StringVar(value=ports),
+                        selectmode="single", width=40, height=min(len(ports), 10))
+        lb.pack(padx=12, pady=4)
+        lb.select_set(0)
+
+        def _select():
+            sel = lb.curselection()
+            if sel:
+                self._port.set(ports[sel[0]])
+            dlg.destroy()
+
+        ttk.Button(dlg, text="Select", command=_select).pack(pady=(4, 10))
+        dlg.grab_set()
+
+    def _find_visa(self):
+        """List available VISA resources and let the user pick one."""
+        try:
+            rm = pyvisa.ResourceManager("@py")
+            resources = rm.list_resources()
+        except Exception as e:
+            tk.messagebox.showerror("VISA Error", str(e))
+            return
+
+        if not resources:
+            tk.messagebox.showinfo("Find Devices", "No VISA devices found.")
+            return
+
+        dlg = tk.Toplevel(self)
+        dlg.title("Select VISA Device")
+        dlg.resizable(False, False)
+        ttk.Label(dlg, text="Select a device:").pack(padx=12, pady=(10, 4))
+        lb = tk.Listbox(dlg, listvariable=tk.StringVar(value=resources),
+                        selectmode="single", width=60, height=min(len(resources), 10))
+        lb.pack(padx=12, pady=4)
+        lb.select_set(0)
+
+        def _select():
+            sel = lb.curselection()
+            if sel:
+                self._visa.set(resources[sel[0]])
+            dlg.destroy()
+
+        ttk.Button(dlg, text="Select", command=_select).pack(pady=(4, 10))
+        dlg.grab_set()
 
     def _row(self, parent, r, label, default):
         ttk.Label(parent, text=label).grid(row=r, column=0, sticky="w", padx=6, pady=2)
