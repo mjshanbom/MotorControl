@@ -21,7 +21,11 @@ import numpy as np
 
 def _load_cal_table(path=None):
     if path is None:
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Data.txt")
+        if getattr(sys, "frozen", False):
+            user_path = os.path.join(os.path.dirname(sys.executable), "Data.txt")
+            path = user_path if os.path.exists(user_path) else os.path.join(sys._MEIPASS, "Data.txt")
+        else:
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Data.txt")
     freqs, factors = [], []
     with open(path) as f:
         for line in f:
