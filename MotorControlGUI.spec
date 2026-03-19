@@ -1,19 +1,11 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 a = Analysis(
-    ['scan_gui.py'],
+    ['motor_control_gui.py'],
     pathex=[],
     binaries=[],
-    datas=[('Data.txt', '.'), ('velmex_vp9000.py', '.')],
+    datas=[('velmex_vp9000.py', '.')],
     hiddenimports=[
-        'pyvisa_py',
-        'pyvisa_py.highlevel',
-        'pyvisa_py.sessions',
-        'pyvisa_py.sessions.serial_session',
-        'pyvisa_py.sessions.tcpip_session',
-        'pyvisa_py.sessions.usb_session',
-        'pyvisa_py.usb',
-        'pyvisa_py.protocols.usbtmc',
         'serial',
         'serial.tools',
         'serial.tools.list_ports',
@@ -36,7 +28,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='ScanGUI',
+    name='MotorControlGUI',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -52,7 +44,7 @@ exe = EXE(
 )
 app = BUNDLE(
     exe,
-    name='ScanGUI.app',
+    name='MotorControlGUI.app',
     icon=None,
     bundle_identifier=None,
 )
