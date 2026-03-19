@@ -163,6 +163,10 @@ class ScopeGUI(tk.Tk):
                  bg=BG_WIDGET, fg=FG_TEXT, insertbackground=FG_TEXT,
                  relief=tk.FLAT, font=("Courier", 10)).pack(side=tk.LEFT, padx=4)
 
+        tk.Button(bar, text="Find", command=self._find_visa,
+                  bg="#444444", fg=FG_TEXT, relief=tk.FLAT,
+                  font=("Helvetica", 10)).pack(side=tk.LEFT, padx=4)
+
         self._btn_conn = tk.Button(bar, text="Connect", width=10,
             command=self._connect, bg="#336633", fg=FG_TEXT, relief=tk.FLAT,
             activebackground="#448844", font=("Helvetica", 10, "bold"))
@@ -345,6 +349,33 @@ class ScopeGUI(tk.Tk):
                  font=("Helvetica", 9), anchor="w").pack(fill=tk.X, padx=8)
 
     # ── Connection ────────────────────────────────────────────────────────── #
+
+    def _find_visa(self):
+        try:
+            rm = pyvisa.ResourceManager("@py")
+            resources = list(rm.list_resources())
+            rm.close()
+        except Exception:
+            resources = []
+        if not resources:
+            import tkinter.messagebox as mb
+            mb.showinfo("Find VISA", "No VISA resources found.")
+            return
+        dlg = tk.Toplevel(self)
+        dlg.title("Select VISA Resource")
+        dlg.resizable(False, False)
+        tk.Label(dlg, text="Select a resource:").pack(padx=12, pady=(10, 4))
+        lb = tk.Listbox(dlg, listvariable=tk.StringVar(value=resources),
+                        selectmode="single", width=56, height=min(len(resources), 10))
+        lb.pack(padx=12, pady=4)
+        lb.select_set(0)
+        def _select():
+            sel = lb.curselection()
+            if sel:
+                self._visa.set(resources[sel[0]])
+            dlg.destroy()
+        tk.Button(dlg, text="Select", command=_select).pack(pady=(4, 10))
+        dlg.grab_set()
 
     def _connect(self):
         self._btn_conn.config(state=tk.DISABLED)
