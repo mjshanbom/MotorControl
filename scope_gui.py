@@ -2,12 +2,13 @@
 Rigol DS1000Z — Single-channel scope GUI with PII / PD readout.
 """
 
+import datetime
 import os
 import queue
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk
+from tkinter import filedialog, ttk
 
 import numpy as np
 import pyvisa
@@ -100,9 +101,10 @@ class ScopeGUI(tk.Tk):
         self.configure(bg=BG_DARK)
         self.minsize(900, 680)
 
-        self._scope = None
-        self._rm    = None
-        self._q     = queue.Queue()
+        self._scope        = None
+        self._rm           = None
+        self._q            = queue.Queue()
+        self._last_capture = None   # stores (voltage, dt, x_origin, results)
 
         # Apply dark ttk theme
         style = ttk.Style(self)
@@ -270,6 +272,12 @@ class ScopeGUI(tk.Tk):
             activebackground="#884444",
             font=("Helvetica", 10, "bold"), state=tk.DISABLED)
         self._btn_stop.pack(fill=tk.X, pady=2)
+
+        self._btn_save = tk.Button(btn_frame, text="Save Waveform",
+            command=self._save_waveform, bg="#444444", fg=FG_TEXT,
+            relief=tk.FLAT, activebackground="#666666",
+            font=("Helvetica", 10, "bold"), state=tk.DISABLED)
+        self._btn_save.pack(fill=tk.X, pady=2)
 
         self._all_btns = [self._btn_apply, self._btn_capture,
                           self._btn_run, self._btn_stop]
@@ -450,7 +458,9 @@ class ScopeGUI(tk.Tk):
             self._scope.write(":RUN")
 
             results = process_waveform(voltage, x_increment)
-            self._q.put({"type": "capture", "t": t, "v": voltage, "results": results})
+            self._q.put({"type": "capture", "t": t, "v": voltage,
+                         "results": results, "dt": x_increment,
+                         "x_origin": x_origin})
 
         except Exception as exc:
             self._q.put({"type": "error", "text": str(exc)})
@@ -482,9 +492,11 @@ class ScopeGUI(tk.Tk):
                     self._status.set(f"Error: {msg['text']}")
 
                 elif t == "capture":
+                    self._last_capture = (msg["v"], msg["dt"], msg["x_origin"], msg["results"])
                     self._update_plot(msg["t"], msg["v"])
                     self._update_results(msg["results"])
                     self._btn_capture.config(state=tk.NORMAL)
+                    self._btn_save.config(state=tk.NORMAL)
                     self._status.set("Capture complete.")
 
                 elif t == "capture_done":
@@ -493,6 +505,49 @@ class ScopeGUI(tk.Tk):
         except queue.Empty:
             pass
         self.after(100, self._poll)
+
+    def _save_waveform(self):
+        if self._last_capture is None:
+            return
+        voltage, dt, x_origin, results = self._last_capture
+
+        default_name = "waveform_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + ".txt"
+        path = filedialog.asksaveasfilename(
+            title="Save Waveform",
+            initialfile=default_name,
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+
+        with open(path, "w") as f:
+            # Header: scope settings and computed results
+            f.write(f"# Saved:      {datetime.datetime.now().isoformat(timespec='seconds')}\n")
+            f.write(f"# Channel:    {self._chan.get()}\n")
+            f.write(f"# Coupling:   {'AC' if self._ac_var.get() else 'DC'}\n")
+            f.write(f"# s/div:      {self._sc_sdiv.get()}\n")
+            f.write(f"# V/div:      {self._sc_vdiv.get()}\n")
+            f.write(f"# Delay (s):  {self._sc_delay.get()}\n")
+            f.write(f"# Acq type:   {self._sc_acq_type.get()}\n")
+            f.write(f"# Mem depth:  {self._sc_mdep.get()}\n")
+            f.write(f"# Trig src:   {self._sc_trig_src.get()}\n")
+            f.write(f"# Trig lev:   {self._sc_trig_lev.get()}\n")
+            f.write(f"# Holdoff:    {self._sc_holdoff.get()}\n")
+            f.write(f"# Samples:    {len(voltage)}\n")
+            f.write(f"# Vpp:        {results['v_pp']:.6g} V\n")
+            f.write(f"# Vrms:       {results['v_rms']:.6g} V\n")
+            f.write(f"# Vmean:      {results['v_mean']:.6g} V\n")
+            f.write(f"# Freq:       {results['freq']:.6g} Hz\n")
+            f.write(f"# PII:        {results['pii']:.6e} J/cm2\n")
+            f.write(f"# PD:         {results['pd']:.6e} s\n")
+            # Data block (compatible with analyze_waveform.py)
+            f.write(f"{dt}\n")
+            f.write(f"{x_origin}\n")
+            for v in voltage:
+                f.write(f"{v}\n")
+
+        self._status.set(f"Saved: {os.path.basename(path)}")
 
     def _update_plot(self, t, v):
         self._trace.set_data(t, v)

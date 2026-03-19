@@ -4,7 +4,9 @@
 import queue
 import threading
 import tkinter as tk
-from tkinter import scrolledtext, ttk
+from tkinter import messagebox, scrolledtext, ttk
+
+import serial.tools.list_ports
 
 from velmex_vp9000 import VP9000
 
@@ -17,10 +19,18 @@ def run_connect(cfg, msg_q):
         motor = VP9000(cfg["port"], baudrate=cfg["baudrate"],
                        bytesize=cfg["bytesize"], parity=cfg["parity"],
                        stopbits=cfg["stopbits"])
-        msg_q.put({"type": "log", "text": "Port open. Put VP9000 online, then use jog controls."})
+        msg_q.put({"type": "log", "text": "Port open. Press Online to enable computer control."})
         msg_q.put({"type": "connected", "motor": motor})
     except Exception as exc:
         msg_q.put({"type": "connect_error", "text": str(exc)})
+
+
+def run_online(motor, msg_q):
+    try:
+        motor.enable_online_mode()
+        msg_q.put({"type": "online"})
+    except Exception as exc:
+        msg_q.put({"type": "error", "text": str(exc)})
 
 
 def run_move(motor, motor_num, steps, speed, stop_event, msg_q):
@@ -45,10 +55,12 @@ def run_home(motor, motor_num, speed, stop_event, msg_q):
 
 # ── GUI ──────────────────────────────────────────────────────────────────── #
 
+STEPS_PER_MM = 160
+
 AXIS_DEFAULTS = [
-    {"label": "X", "motor": "1", "step": "500"},
-    {"label": "Y", "motor": "2", "step": "500"},
-    {"label": "Z", "motor": "3", "step": "500"},
+    {"label": "X", "motor": "1", "step": "3.0", "spmm": str(STEPS_PER_MM)},
+    {"label": "Y", "motor": "2", "step": "3.0", "spmm": str(STEPS_PER_MM)},
+    {"label": "Z", "motor": "3", "step": "0.25","spmm": str(STEPS_PER_MM)},
 ]
 
 
@@ -81,7 +93,8 @@ class MotorControlApp(tk.Tk):
 
         ttk.Label(conn, text="Motor port").grid(row=0, column=0, sticky="w", padx=6, pady=2)
         self._port = tk.StringVar(value="/dev/tty.usbserial-FTEHI1FO")
-        ttk.Entry(conn, textvariable=self._port, width=36).grid(row=0, column=1, columnspan=3, padx=6, pady=2)
+        ttk.Entry(conn, textvariable=self._port, width=36).grid(row=0, column=1, padx=6, pady=2)
+        ttk.Button(conn, text="Find", command=self._find_port).grid(row=0, column=2, padx=(0, 8), pady=2)
 
         rs = ttk.Frame(conn)
         rs.grid(row=1, column=0, columnspan=4, sticky="w", padx=6, pady=2)
@@ -105,7 +118,7 @@ class MotorControlApp(tk.Tk):
         axes_frame = ttk.LabelFrame(self, text="Axes")
         axes_frame.grid(row=1, column=0, sticky="ew", **pad)
 
-        headers = ["Axis", "Motor #", "Step size", "Position", "Jog", "Home"]
+        headers = ["Axis", "Motor #", "Step (mm)", "Steps/mm", "Position (mm)", "Jog", "Home"]
         for col, h in enumerate(headers):
             ttk.Label(axes_frame, text=h, font=("", 10, "bold")).grid(
                 row=0, column=col, padx=6, pady=(4, 2))
@@ -124,21 +137,27 @@ class MotorControlApp(tk.Tk):
                         width=4).grid(row=row_idx, column=1, padx=6)
             row_widgets["motor"] = motor_var
 
-            # Step size
+            # Step size (mm)
             step_var = tk.StringVar(value=defaults["step"])
             ttk.Entry(axes_frame, textvariable=step_var, width=8).grid(
                 row=row_idx, column=2, padx=6)
             row_widgets["step"] = step_var
 
-            # Position display
-            pos_var = tk.StringVar(value="0")
+            # Steps/mm
+            spmm_var = tk.StringVar(value=defaults["spmm"])
+            ttk.Entry(axes_frame, textvariable=spmm_var, width=6).grid(
+                row=row_idx, column=3, padx=6)
+            row_widgets["spmm"] = spmm_var
+
+            # Position display (mm)
+            pos_var = tk.StringVar(value="0.000")
             ttk.Label(axes_frame, textvariable=pos_var, width=10,
-                      relief="sunken", anchor="e").grid(row=row_idx, column=3, padx=6)
+                      relief="sunken", anchor="e").grid(row=row_idx, column=4, padx=6)
             row_widgets["pos"] = pos_var
 
             # Jog buttons
             jog_frame = ttk.Frame(axes_frame)
-            jog_frame.grid(row=row_idx, column=4, padx=6)
+            jog_frame.grid(row=row_idx, column=5, padx=6)
             neg_btn = ttk.Button(jog_frame, text="  −  ", width=4,
                                  command=lambda r=row_idx-1: self._jog(r, -1))
             neg_btn.pack(side="left", padx=2)
@@ -151,7 +170,7 @@ class MotorControlApp(tk.Tk):
             # Home button
             home_btn = ttk.Button(axes_frame, text="Home",
                                   command=lambda r=row_idx-1: self._home(r))
-            home_btn.grid(row=row_idx, column=5, padx=6)
+            home_btn.grid(row=row_idx, column=6, padx=6)
             row_widgets["home_btn"] = home_btn
 
             self._axis_widgets.append(row_widgets)
@@ -171,6 +190,9 @@ class MotorControlApp(tk.Tk):
 
         self._connect_btn = ttk.Button(btn, text="Connect", command=self._connect)
         self._connect_btn.pack(side="left", padx=6)
+        self._online_btn = ttk.Button(btn, text="Online", command=self._go_online,
+                                      state="disabled")
+        self._online_btn.pack(side="left", padx=6)
         self._disconnect_btn = ttk.Button(btn, text="Disconnect",
                                           command=self._disconnect, state="disabled")
         self._disconnect_btn.pack(side="left", padx=6)
@@ -208,6 +230,36 @@ class MotorControlApp(tk.Tk):
         self._status_var.set("Connecting…")
         threading.Thread(target=run_connect, args=(cfg, self._msg_q), daemon=True).start()
 
+    def _find_port(self):
+        ports = [p.device for p in serial.tools.list_ports.comports()]
+        if not ports:
+            messagebox.showinfo("Find Ports", "No serial ports found.")
+            return
+        dlg = tk.Toplevel(self)
+        dlg.title("Select Serial Port")
+        dlg.resizable(False, False)
+        ttk.Label(dlg, text="Select a port:").pack(padx=12, pady=(10, 4))
+        lb = tk.Listbox(dlg, listvariable=tk.StringVar(value=ports),
+                        selectmode="single", width=40, height=min(len(ports), 10))
+        lb.pack(padx=12, pady=4)
+        lb.select_set(0)
+        def _select():
+            sel = lb.curselection()
+            if sel:
+                self._port.set(ports[sel[0]])
+            dlg.destroy()
+        ttk.Button(dlg, text="Select", command=_select).pack(pady=(4, 10))
+        dlg.grab_set()
+
+    def _go_online(self):
+        if self._motor is None:
+            return
+        self._online_btn.config(state="disabled")
+        self._status_var.set("Going online…")
+        self._log_line("Sending online command (F)…")
+        threading.Thread(target=run_online, args=(self._motor, self._msg_q),
+                         daemon=True).start()
+
     def _disconnect(self):
         if self._motor:
             try:
@@ -216,6 +268,7 @@ class MotorControlApp(tk.Tk):
                 pass
         self._motor = None
         self._connect_btn.config(state="normal")
+        self._online_btn.config(state="disabled")
         self._disconnect_btn.config(state="disabled")
         self._stop_btn.config(state="disabled")
         self._set_jog_buttons_state("disabled")
@@ -238,11 +291,12 @@ class MotorControlApp(tk.Tk):
         w = self._axis_widgets[axis_idx]
         try:
             motor_num = int(w["motor"].get())
-            step_size = int(w["step"].get())
+            step_mm   = float(w["step"].get())
+            spmm      = float(w["spmm"].get())
         except ValueError:
             self._log_line("Invalid motor # or step size.")
             return
-        steps = direction * step_size
+        steps = int(round(direction * step_mm * spmm))
         self._start_move(motor_num, steps)
 
     def _home(self, axis_idx):
@@ -300,9 +354,15 @@ class MotorControlApp(tk.Tk):
                 elif t == "connected":
                     self._motor = msg["motor"]
                     self._connect_btn.config(state="disabled")
+                    self._online_btn.config(state="normal")
                     self._disconnect_btn.config(state="normal")
+                    self._status_var.set("Connected — press Online to enable control.")
+
+                elif t == "online":
+                    self._online_btn.config(state="disabled")
                     self._set_jog_buttons_state("normal")
-                    self._status_var.set("Connected.")
+                    self._log_line("Controller online. Ready.")
+                    self._status_var.set("Ready.")
 
                 elif t == "connect_error":
                     self._log_line(f"Connect error: {msg['text']}")
@@ -314,10 +374,15 @@ class MotorControlApp(tk.Tk):
                     self._positions[motor_num] += msg["steps"]
                     for w in self._axis_widgets:
                         if int(w["motor"].get()) == motor_num:
-                            w["pos"].set(str(self._positions[motor_num]))
+                            try:
+                                spmm = float(w["spmm"].get())
+                            except ValueError:
+                                spmm = STEPS_PER_MM
+                            pos_mm = self._positions[motor_num] / spmm
+                            w["pos"].set(f"{pos_mm:.3f}")
                     self._log_line(
                         f"Motor {motor_num} moved {msg['steps']:+d} steps  "
-                        f"→ position {self._positions[motor_num]}")
+                        f"→ {self._positions[motor_num] / STEPS_PER_MM:.3f} mm")
                     self._moving = False
                     self._set_jog_buttons_state("normal")
                     self._stop_btn.config(state="disabled")
@@ -328,7 +393,7 @@ class MotorControlApp(tk.Tk):
                     self._positions[motor_num] = 0
                     for w in self._axis_widgets:
                         if int(w["motor"].get()) == motor_num:
-                            w["pos"].set("0")
+                            w["pos"].set("0.000")
                     self._log_line(f"Motor {motor_num} homed.")
                     self._moving = False
                     self._set_jog_buttons_state("normal")

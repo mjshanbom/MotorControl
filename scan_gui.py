@@ -368,14 +368,14 @@ class ScanApp(tk.Tk):
         self._set = self._row(mot, 4, "Settle (s)", "0.05")
 
         # ── Grid ─────────────────────────────────────────────────────────── #
-        grid = ttk.LabelFrame(self, text="Scan Grid (steps)")
+        grid = ttk.LabelFrame(self, text="Scan Grid (mm)")
         grid.grid(row=1, column=1, sticky="nsew", **pad)
 
         ttk.Label(grid, text="").grid(row=0, column=0)
-        ttk.Label(grid, text="Center",   width=8).grid(row=0, column=1)
-        ttk.Label(grid, text="Range",    width=8).grid(row=0, column=2)
-        ttk.Label(grid, text="Step",     width=8).grid(row=0, column=3)
-        ttk.Label(grid, text="Steps/mm", width=8).grid(row=0, column=4)
+        ttk.Label(grid, text="Center(mm)", width=9).grid(row=0, column=1)
+        ttk.Label(grid, text="Range(mm)",  width=9).grid(row=0, column=2)
+        ttk.Label(grid, text="Step(mm)",   width=9).grid(row=0, column=3)
+        ttk.Label(grid, text="Steps/mm",   width=8).grid(row=0, column=4)
 
         self._xc, self._xr, self._xst, self._x_spmm = self._axis_row(grid, 1, "X")
         self._yc, self._yr, self._yst, self._y_spmm = self._axis_row(grid, 2, "Y")
@@ -519,9 +519,9 @@ class ScanApp(tk.Tk):
     def _axis_row(self, parent, r, axis):
         ttk.Label(parent, text=axis).grid(row=r, column=0, padx=6, pady=2)
         defaults = {
-            "X": ("0", "5000", "500", "160"),
-            "Y": ("0", "5000", "500", "160"),
-            "Z": ("0", "0",    "1",   "160"),
+            "X": ("0", "30",  "3",    "160"),
+            "Y": ("0", "30",  "3",    "160"),
+            "Z": ("0", "0",   "0.25", "160"),
         }
         vs = []
         for c, val in enumerate(defaults[axis], start=1):
@@ -563,18 +563,18 @@ class ScanApp(tk.Tk):
             "z_motor":  int(self._zm.get()),
             "speed":    int(self._spd.get()),
             "settle":   float(self._set.get()),
-            "x_center": int(self._xc.get()),
-            "x_range":  int(self._xr.get()),
-            "x_step":   int(self._xst.get()),
-            "y_center": int(self._yc.get()),
-            "y_range":  int(self._yr.get()),
-            "y_step":   int(self._yst.get()),
-            "z_center": int(self._zc.get()),
-            "z_range":  int(self._zr.get()),
-            "z_step":   int(self._zst.get()),
             "x_spmm":   float(self._x_spmm.get()),
             "y_spmm":   float(self._y_spmm.get()),
             "z_spmm":   float(self._z_spmm.get()),
+            "x_center": int(round(float(self._xc.get())  * float(self._x_spmm.get()))),
+            "x_range":  int(round(float(self._xr.get())  * float(self._x_spmm.get()))),
+            "x_step":   int(round(float(self._xst.get()) * float(self._x_spmm.get()))),
+            "y_center": int(round(float(self._yc.get())  * float(self._y_spmm.get()))),
+            "y_range":  int(round(float(self._yr.get())  * float(self._y_spmm.get()))),
+            "y_step":   int(round(float(self._yst.get()) * float(self._y_spmm.get()))),
+            "z_center": int(round(float(self._zc.get())  * float(self._z_spmm.get()))),
+            "z_range":  int(round(float(self._zr.get())  * float(self._z_spmm.get()))),
+            "z_step":   int(round(float(self._zst.get()) * float(self._z_spmm.get()))),
             # scope config
             "scope_mode":     self._sc_mode.get(),
             "scope_sdiv":     self._sc_sdiv.get(),

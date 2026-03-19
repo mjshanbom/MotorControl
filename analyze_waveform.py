@@ -50,7 +50,7 @@ def load_waveform(path):
     Line 3+: voltage samples (volts)
     """
     with open(path, encoding='latin-1') as f:
-        lines = [l.strip() for l in f if l.strip()]
+        lines = [l.strip() for l in f if l.strip() and not l.startswith('#')]
     dt        = float(lines[0])
     timescale = abs(float(lines[1]))
     samples = []
