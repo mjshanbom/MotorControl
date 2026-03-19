@@ -191,7 +191,11 @@ def run_connect(cfg, msg_q):
         msg_q.put({"type": "log", "text": "Motor port open. Now put VP9000 in online mode."})
 
         msg_q.put({"type": "log", "text": f"Connecting to scope at {cfg['visa']}..."})
-        rm = pyvisa.ResourceManager("@py")
+        try:
+            rm = pyvisa.ResourceManager()
+            rm.list_resources()
+        except Exception:
+            rm = pyvisa.ResourceManager("@py")
         scope = rm.open_resource(cfg["visa"])
         scope.timeout = 3000
         scope.chunk_size = 1024 * 1024
@@ -504,8 +508,13 @@ class ScanApp(tk.Tk):
     def _find_visa(self):
         """List available VISA resources and let the user pick one."""
         try:
-            rm = pyvisa.ResourceManager("@py")
-            resources = rm.list_resources()
+            try:
+                rm = pyvisa.ResourceManager()
+                resources = rm.list_resources()
+            except Exception:
+                rm = pyvisa.ResourceManager("@py")
+                resources = rm.list_resources()
+            rm.close()
         except Exception as e:
             tk.messagebox.showerror("VISA Error", str(e))
             return

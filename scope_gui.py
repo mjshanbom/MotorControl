@@ -350,9 +350,19 @@ class ScopeGUI(tk.Tk):
 
     # ── Connection ────────────────────────────────────────────────────────── #
 
+    @staticmethod
+    def _open_rm():
+        """Return a ResourceManager, preferring NI-VISA, falling back to @py."""
+        try:
+            rm = pyvisa.ResourceManager()
+            rm.list_resources()   # probe — raises if no backend
+            return rm
+        except Exception:
+            return pyvisa.ResourceManager("@py")
+
     def _find_visa(self):
         try:
-            rm = pyvisa.ResourceManager("@py")
+            rm = self._open_rm()
             resources = list(rm.list_resources())
             rm.close()
         except Exception:
@@ -384,7 +394,7 @@ class ScopeGUI(tk.Tk):
 
     def _thread_connect(self):
         try:
-            self._rm    = pyvisa.ResourceManager("@py")
+            self._rm    = self._open_rm()
             self._scope = self._rm.open_resource(self._visa.get())
             self._scope.timeout    = 3000
             self._scope.chunk_size = 1024 * 1024
