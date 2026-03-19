@@ -55,12 +55,12 @@ def run_home(motor, motor_num, speed, stop_event, msg_q):
 
 # ── GUI ──────────────────────────────────────────────────────────────────── #
 
-STEPS_PER_MM = 160
+LAB_SPMM = {"Optics Lab (160 steps/mm)": 160, "Acoustics Lab (200 steps/mm)": 200}
 
 AXIS_DEFAULTS = [
-    {"label": "X", "motor": "1", "step": "3.0", "spmm": str(STEPS_PER_MM)},
-    {"label": "Y", "motor": "2", "step": "3.0", "spmm": str(STEPS_PER_MM)},
-    {"label": "Z", "motor": "3", "step": "0.25","spmm": str(STEPS_PER_MM)},
+    {"label": "X", "motor": "1", "step": "3.0"},
+    {"label": "Y", "motor": "2", "step": "3.0"},
+    {"label": "Z", "motor": "3", "step": "0.25"},
 ]
 
 
@@ -114,11 +114,16 @@ class MotorControlApp(tk.Tk):
         self._speed = tk.StringVar(value="1000")
         ttk.Entry(conn, textvariable=self._speed, width=10).grid(row=2, column=1, sticky="w", padx=6)
 
+        ttk.Label(conn, text="Lab").grid(row=3, column=0, sticky="w", padx=6, pady=2)
+        self._lab = tk.StringVar(value="Optics Lab (160 steps/mm)")
+        ttk.Combobox(conn, textvariable=self._lab, values=list(LAB_SPMM.keys()),
+                     state="readonly", width=28).grid(row=3, column=1, sticky="w", padx=6, pady=2)
+
         # ── Axes ─────────────────────────────────────────────────────────── #
         axes_frame = ttk.LabelFrame(self, text="Axes")
         axes_frame.grid(row=1, column=0, sticky="ew", **pad)
 
-        headers = ["Axis", "Motor #", "Step (mm)", "Steps/mm", "Position (mm)", "Jog", "Home"]
+        headers = ["Axis", "Motor #", "Step (mm)", "Position (mm)", "Jog", "Home"]
         for col, h in enumerate(headers):
             ttk.Label(axes_frame, text=h, font=("", 10, "bold")).grid(
                 row=0, column=col, padx=6, pady=(4, 2))
@@ -143,21 +148,15 @@ class MotorControlApp(tk.Tk):
                 row=row_idx, column=2, padx=6)
             row_widgets["step"] = step_var
 
-            # Steps/mm
-            spmm_var = tk.StringVar(value=defaults["spmm"])
-            ttk.Entry(axes_frame, textvariable=spmm_var, width=6).grid(
-                row=row_idx, column=3, padx=6)
-            row_widgets["spmm"] = spmm_var
-
             # Position display (mm)
             pos_var = tk.StringVar(value="0.000")
             ttk.Label(axes_frame, textvariable=pos_var, width=10,
-                      relief="sunken", anchor="e").grid(row=row_idx, column=4, padx=6)
+                      relief="sunken", anchor="e").grid(row=row_idx, column=3, padx=6)
             row_widgets["pos"] = pos_var
 
             # Jog buttons
             jog_frame = ttk.Frame(axes_frame)
-            jog_frame.grid(row=row_idx, column=5, padx=6)
+            jog_frame.grid(row=row_idx, column=4, padx=6)
             neg_btn = ttk.Button(jog_frame, text="  −  ", width=4,
                                  command=lambda r=row_idx-1: self._jog(r, -1))
             neg_btn.pack(side="left", padx=2)
@@ -170,7 +169,7 @@ class MotorControlApp(tk.Tk):
             # Home button
             home_btn = ttk.Button(axes_frame, text="Home",
                                   command=lambda r=row_idx-1: self._home(r))
-            home_btn.grid(row=row_idx, column=6, padx=6)
+            home_btn.grid(row=row_idx, column=5, padx=6)
             row_widgets["home_btn"] = home_btn
 
             self._axis_widgets.append(row_widgets)
@@ -292,10 +291,10 @@ class MotorControlApp(tk.Tk):
         try:
             motor_num = int(w["motor"].get())
             step_mm   = float(w["step"].get())
-            spmm      = float(w["spmm"].get())
         except ValueError:
             self._log_line("Invalid motor # or step size.")
             return
+        spmm  = LAB_SPMM[self._lab.get()]
         steps = int(round(direction * step_mm * spmm))
         self._start_move(motor_num, steps)
 
@@ -372,17 +371,14 @@ class MotorControlApp(tk.Tk):
                 elif t == "move_done":
                     motor_num = msg["motor"]
                     self._positions[motor_num] += msg["steps"]
+                    spmm = LAB_SPMM[self._lab.get()]
                     for w in self._axis_widgets:
                         if int(w["motor"].get()) == motor_num:
-                            try:
-                                spmm = float(w["spmm"].get())
-                            except ValueError:
-                                spmm = STEPS_PER_MM
                             pos_mm = self._positions[motor_num] / spmm
                             w["pos"].set(f"{pos_mm:.3f}")
                     self._log_line(
                         f"Motor {motor_num} moved {msg['steps']:+d} steps  "
-                        f"→ {self._positions[motor_num] / STEPS_PER_MM:.3f} mm")
+                        f"→ {self._positions[motor_num] / spmm:.3f} mm")
                     self._moving = False
                     self._set_jog_buttons_state("normal")
                     self._stop_btn.config(state="disabled")

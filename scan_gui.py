@@ -352,9 +352,15 @@ class ScanApp(tk.Tk):
         ttk.Checkbutton(conn, text="AC coupling", variable=self._ac_var).grid(
             row=2, column=2, padx=8, sticky="w")
 
+        ttk.Label(conn, text="Lab").grid(row=3, column=0, sticky="w", padx=6, pady=2)
+        self._lab = tk.StringVar(value="Optics Lab (160 steps/mm)")
+        ttk.Combobox(conn, textvariable=self._lab,
+                     values=["Optics Lab (160 steps/mm)", "Acoustics Lab (200 steps/mm)"],
+                     state="readonly", width=28).grid(row=3, column=1, sticky="w", padx=6, pady=2)
+
         # RS-232 settings sub-row
         rs = ttk.Frame(conn)
-        rs.grid(row=3, column=0, columnspan=2, sticky="w", padx=6, pady=2)
+        rs.grid(row=4, column=0, columnspan=2, sticky="w", padx=6, pady=2)
         ttk.Label(rs, text="Baud").pack(side="left")
         self._baud = tk.StringVar(value="9600")
         ttk.Combobox(rs, textvariable=self._baud, values=["9600","19200","38400","57600","115200"],
@@ -390,11 +396,10 @@ class ScanApp(tk.Tk):
         ttk.Label(grid, text="Center(mm)", width=9).grid(row=0, column=1)
         ttk.Label(grid, text="Range(mm)",  width=9).grid(row=0, column=2)
         ttk.Label(grid, text="Step(mm)",   width=9).grid(row=0, column=3)
-        ttk.Label(grid, text="Steps/mm",   width=8).grid(row=0, column=4)
 
-        self._xc, self._xr, self._xst, self._x_spmm = self._axis_row(grid, 1, "X")
-        self._yc, self._yr, self._yst, self._y_spmm = self._axis_row(grid, 2, "Y")
-        self._zc, self._zr, self._zst, self._z_spmm = self._axis_row(grid, 3, "Z")
+        self._xc, self._xr, self._xst = self._axis_row(grid, 1, "X")
+        self._yc, self._yr, self._yst = self._axis_row(grid, 2, "Y")
+        self._zc, self._zr, self._zst = self._axis_row(grid, 3, "Z")
 
         # ── Scope Config ─────────────────────────────────────────────────── #
         sc = ttk.LabelFrame(self, text="Scope Config")
@@ -536,9 +541,9 @@ class ScanApp(tk.Tk):
     def _axis_row(self, parent, r, axis):
         ttk.Label(parent, text=axis).grid(row=r, column=0, padx=6, pady=2)
         defaults = {
-            "X": ("0", "30",  "3",    "160"),
-            "Y": ("0", "30",  "3",    "160"),
-            "Z": ("0", "0",   "0.25", "160"),
+            "X": ("0", "30",  "3"),
+            "Y": ("0", "30",  "3"),
+            "Z": ("0", "0",   "0.25"),
         }
         vs = []
         for c, val in enumerate(defaults[axis], start=1):
@@ -565,6 +570,8 @@ class ScanApp(tk.Tk):
     # ── Connection control ───────────────────────────────────────────────── #
 
     def _collect_cfg(self):
+        lab_spmm = {"Optics Lab (160 steps/mm)": 160, "Acoustics Lab (200 steps/mm)": 200}
+        spmm = lab_spmm[self._lab.get()]
         return {
             "port":     self._port.get(),
             "visa":     self._visa.get(),
@@ -580,18 +587,18 @@ class ScanApp(tk.Tk):
             "z_motor":  int(self._zm.get()),
             "speed":    int(self._spd.get()),
             "settle":   float(self._set.get()),
-            "x_spmm":   float(self._x_spmm.get()),
-            "y_spmm":   float(self._y_spmm.get()),
-            "z_spmm":   float(self._z_spmm.get()),
-            "x_center": int(round(float(self._xc.get())  * float(self._x_spmm.get()))),
-            "x_range":  int(round(float(self._xr.get())  * float(self._x_spmm.get()))),
-            "x_step":   int(round(float(self._xst.get()) * float(self._x_spmm.get()))),
-            "y_center": int(round(float(self._yc.get())  * float(self._y_spmm.get()))),
-            "y_range":  int(round(float(self._yr.get())  * float(self._y_spmm.get()))),
-            "y_step":   int(round(float(self._yst.get()) * float(self._y_spmm.get()))),
-            "z_center": int(round(float(self._zc.get())  * float(self._z_spmm.get()))),
-            "z_range":  int(round(float(self._zr.get())  * float(self._z_spmm.get()))),
-            "z_step":   int(round(float(self._zst.get()) * float(self._z_spmm.get()))),
+            "x_spmm":   spmm,
+            "y_spmm":   spmm,
+            "z_spmm":   spmm,
+            "x_center": int(round(float(self._xc.get())  * spmm)),
+            "x_range":  int(round(float(self._xr.get())  * spmm)),
+            "x_step":   int(round(float(self._xst.get()) * spmm)),
+            "y_center": int(round(float(self._yc.get())  * spmm)),
+            "y_range":  int(round(float(self._yr.get())  * spmm)),
+            "y_step":   int(round(float(self._yst.get()) * spmm)),
+            "z_center": int(round(float(self._zc.get())  * spmm)),
+            "z_range":  int(round(float(self._zr.get())  * spmm)),
+            "z_step":   int(round(float(self._zst.get()) * spmm)),
             # scope config
             "scope_mode":     self._sc_mode.get(),
             "scope_sdiv":     self._sc_sdiv.get(),
