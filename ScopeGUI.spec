@@ -1,12 +1,22 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-
 a = Analysis(
     ['scope_gui.py'],
     pathex=[],
     binaries=[],
     datas=[('Data.txt', '.')],
-    hiddenimports=['pyvisa_py', 'pyvisa_py.highlevel', 'pyvisa_py.sessions', 'pyvisa_py.usb', 'pyvisa_py.protocols.usbtmc'],
+    hiddenimports=[
+        'pyvisa_py',
+        'pyvisa_py.highlevel',
+        'pyvisa_py.sessions',
+        'pyvisa_py.sessions.serial_session',
+        'pyvisa_py.sessions.tcpip_session',
+        'pyvisa_py.sessions.usb_session',
+        'pyvisa_py.usb',
+        'pyvisa_py.protocols.usbtmc',
+        'matplotlib.backends.backend_tkagg',
+        'matplotlib.backends._backend_tk',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

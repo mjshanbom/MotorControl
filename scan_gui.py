@@ -166,6 +166,16 @@ def capture(scope, pre, stop_event=None):
     }
 
 
+def run_online(motor, msg_q):
+    """Send VP9000 online command in a background thread."""
+    try:
+        msg_q.put({"type": "log", "text": "Sending online command..."})
+        motor.enable_online_mode()
+        msg_q.put({"type": "online"})
+    except Exception as exc:
+        msg_q.put({"type": "log", "text": f"Online error: {exc}"})
+
+
 def run_connect(cfg, msg_q):
     """Open serial port + scope. No commands sent to the VP9000.
     After this returns, put the VP9000 in online mode manually, then Start Scan."""
@@ -449,6 +459,8 @@ class ScanApp(tk.Tk):
         self._connect_btn.pack(side="left", padx=6)
         self._disconnect_btn = ttk.Button(btn, text="Disconnect", command=self._disconnect, state="disabled")
         self._disconnect_btn.pack(side="left", padx=6)
+        self._online_btn = ttk.Button(btn, text="Online", command=self._go_online, state="disabled")
+        self._online_btn.pack(side="left", padx=6)
         self._start_btn = ttk.Button(btn, text="Start Scan", command=self._start, state="disabled")
         self._start_btn.pack(side="left", padx=6)
         self._stop_btn  = ttk.Button(btn, text="Stop", command=self._stop, state="disabled")
@@ -598,6 +610,10 @@ class ScanApp(tk.Tk):
         self._status_var.set("Connecting…")
         threading.Thread(target=run_connect, args=(cfg, self._msg_q), daemon=True).start()
 
+    def _go_online(self):
+        self._online_btn.config(state="disabled")
+        threading.Thread(target=run_online, args=(self._motor, self._msg_q), daemon=True).start()
+
     def _disconnect(self):
         if self._motor:
             try:
@@ -613,6 +629,7 @@ class ScanApp(tk.Tk):
             self._scope = None
         self._connect_btn.config(state="normal")
         self._disconnect_btn.config(state="disabled")
+        self._online_btn.config(state="disabled")
         self._start_btn.config(state="disabled")
         self._apply_scope_btn.config(state="disabled")
         self._status_var.set("Disconnected.")
@@ -690,9 +707,15 @@ class ScanApp(tk.Tk):
                     self._scope = msg["scope"]
                     self._connect_btn.config(state="disabled")
                     self._disconnect_btn.config(state="normal")
-                    self._start_btn.config(state="normal")
+                    self._online_btn.config(state="normal")
                     self._apply_scope_btn.config(state="normal")
-                    self._status_var.set("Connected. Put VP9000 online, then Start Scan.")
+                    self._status_var.set("Connected. Click Online to enable the controller.")
+
+                elif t == "online":
+                    self._online_btn.config(state="disabled")
+                    self._start_btn.config(state="normal")
+                    self._status_var.set("Controller online. Ready to scan.")
+                    self._log_line("Controller online. Ready.")
 
                 elif t == "connect_error":
                     self._log_line(f"Connect error: {msg['text']}")
@@ -729,6 +752,7 @@ class ScanApp(tk.Tk):
                     self._start_btn.config(state="normal")
                     self._disconnect_btn.config(state="normal")
                     self._stop_btn.config(state="disabled")
+                    self._online_btn.config(state="normal")
 
         except queue.Empty:
             pass
