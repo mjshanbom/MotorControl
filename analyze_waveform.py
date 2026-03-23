@@ -74,27 +74,44 @@ def analyze(dt, voltage):
     """Replicate the calculations in scan_gui.capture()."""
     v_ac = voltage - voltage.mean()
 
-    # Frequency: zero-crossing counter with amplitude threshold
-    threshold = 0.15 * np.max(np.abs(v_ac))
+    # Frequency: FFT primary (robust against noise, ringing, and low samples/cycle)
+    n = len(v_ac)
+    fft_mag = np.abs(np.fft.rfft(v_ac * np.hanning(n)))
+    fft_freqs = np.fft.rfftfreq(n, d=dt)
+    mask = (fft_freqs >= 0.5e6) & (fft_freqs <= 25e6)
+    if mask.any():
+        sub_mag   = fft_mag[mask]
+        sub_freqs = fft_freqs[mask]
+        peak_i = int(np.argmax(sub_mag))
+        if 0 < peak_i < len(sub_mag) - 1:
+            alpha, beta, gamma = sub_mag[peak_i-1], sub_mag[peak_i], sub_mag[peak_i+1]
+            correction = 0.5 * (alpha - gamma) / (alpha - 2*beta + gamma)
+            fft_freq = sub_freqs[peak_i] + correction * (sub_freqs[1] - sub_freqs[0])
+        else:
+            fft_freq = sub_freqs[peak_i]
+    else:
+        fft_freq = 0.0
+
+    # Zero-crossing counter with adaptive window (±0.75 cycles at FFT-estimated frequency)
+    threshold   = 0.15 * np.max(np.abs(v_ac))
+    half_win    = max(3, int(round(0.75 / (fft_freq * dt)))) if fft_freq > 0 else 50
     raw_crosses = np.where((v_ac[:-1] < 0) & (v_ac[1:] >= 0))[0]
     crosses = [i for i in raw_crosses
-               if np.max(v_ac[max(0, i - 50):i + 51]) >  threshold
-               and np.min(v_ac[max(0, i - 50):i + 51]) < -threshold]
+               if np.max(v_ac[max(0, i - half_win):i + half_win + 1]) >  threshold
+               and np.min(v_ac[max(0, i - half_win):i + half_win + 1]) < -threshold]
     if len(crosses) >= 2:
         refined = []
         for i in crosses:
             frac = -v_ac[i] / (v_ac[i + 1] - v_ac[i])
             refined.append((i + frac) * dt)
         periods = np.diff(refined)
-        freq = float(1.0 / np.mean(periods))
+        zc_freq = float(1.0 / np.median(periods))
+        if fft_freq > 0 and abs(zc_freq - fft_freq) / fft_freq < 0.20:
+            freq = zc_freq
+        else:
+            freq = fft_freq
     else:
-        # Single-cycle fallback: peak-to-trough half-period.
-        # Robust for arbitrary frequencies; accuracy limited only by sample
-        # resolution, not FFT bin spacing.
-        idx_peak   = int(np.argmax(v_ac))
-        idx_trough = int(np.argmin(v_ac))
-        half_period = abs(idx_peak - idx_trough) * dt
-        freq = float(1.0 / (2 * half_period)) if half_period > 0 else 0.0
+        freq = fft_freq if fft_freq > 0 else 0.0
 
     RHO_C = 1.54e6  # acoustic impedance of water (Pa·s/m)
 

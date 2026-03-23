@@ -56,24 +56,48 @@ def process_waveform(voltage, dt):
     """Compute frequency, PII, and PD from a captured waveform."""
     v_ac = voltage - voltage.mean()
 
-    # Frequency: zero-crossing counter with 15% threshold
+    # Frequency: FFT primary (robust against noise, ringing, and low samples/cycle)
+    n = len(v_ac)
+    fft_mag = np.abs(np.fft.rfft(v_ac * np.hanning(n)))
+    freqs   = np.fft.rfftfreq(n, d=dt)
+    # Search 0.5–25 MHz only (ignore DC and ultra-high harmonics)
+    mask = (freqs >= 0.5e6) & (freqs <= 25e6)
+    if mask.any():
+        sub_mag   = fft_mag[mask]
+        sub_freqs = freqs[mask]
+        peak_i = int(np.argmax(sub_mag))
+        # Parabolic interpolation for sub-bin accuracy
+        if 0 < peak_i < len(sub_mag) - 1:
+            alpha, beta, gamma = sub_mag[peak_i-1], sub_mag[peak_i], sub_mag[peak_i+1]
+            correction = 0.5 * (alpha - gamma) / (alpha - 2*beta + gamma)
+            fft_freq = sub_freqs[peak_i] + correction * (sub_freqs[1] - sub_freqs[0])
+        else:
+            fft_freq = sub_freqs[peak_i]
+    else:
+        fft_freq = 0.0
+
+    # Zero-crossing counter with adaptive window (±0.75 cycles at FFT-estimated frequency)
     threshold    = 0.15 * np.max(np.abs(v_ac))
+    half_win     = max(3, int(round(0.75 / (fft_freq * dt)))) if fft_freq > 0 else 50
     raw_crosses  = np.where((v_ac[:-1] < 0) & (v_ac[1:] >= 0))[0]
     crosses      = [i for i in raw_crosses
-                    if np.max(v_ac[max(0, i - 50):i + 51]) >  threshold
-                    and np.min(v_ac[max(0, i - 50):i + 51]) < -threshold]
+                    if np.max(v_ac[max(0, i - half_win):i + half_win + 1]) >  threshold
+                    and np.min(v_ac[max(0, i - half_win):i + half_win + 1]) < -threshold]
     if len(crosses) >= 2:
         refined = []
         for i in crosses:
             frac = -v_ac[i] / (v_ac[i + 1] - v_ac[i])
             refined.append((i + frac) * dt)
-        freq = float(1.0 / np.mean(np.diff(refined)))
+        periods = np.diff(refined)
+        # Use median — robust against spurious crossings from ringing/reflections
+        zc_freq = float(1.0 / np.median(periods))
+        # Accept zero-crossing result only if it agrees with FFT within 20%
+        if fft_freq > 0 and abs(zc_freq - fft_freq) / fft_freq < 0.20:
+            freq = zc_freq
+        else:
+            freq = fft_freq
     else:
-        # Single-cycle fallback: peak-to-trough half-period
-        idx_peak   = int(np.argmax(v_ac))
-        idx_trough = int(np.argmin(v_ac))
-        half_period = abs(idx_peak - idx_trough) * dt
-        freq = float(1.0 / (2 * half_period)) if half_period > 0 else 0.0
+        freq = fft_freq if fft_freq > 0 else 0.0
 
     freq_mhz   = freq / 1e6
     cal_idx    = int(np.argmin(np.abs(_CAL_FREQS - freq_mhz)))
