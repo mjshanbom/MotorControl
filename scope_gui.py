@@ -60,8 +60,7 @@ def process_waveform(voltage, dt):
     n = len(v_ac)
     fft_mag = np.abs(np.fft.rfft(v_ac * np.hanning(n)))
     freqs   = np.fft.rfftfreq(n, d=dt)
-    # Search 0.5–25 MHz only (ignore DC and ultra-high harmonics)
-    mask = (freqs >= 0.5e6) & (freqs <= 25e6)
+    mask = freqs > 0  # exclude DC bin only
     if mask.any():
         sub_mag   = fft_mag[mask]
         sub_freqs = freqs[mask]

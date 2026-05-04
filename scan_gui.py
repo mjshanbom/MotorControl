@@ -121,7 +121,7 @@ def capture(scope, pre, stop_event=None):
     n = len(v_ac)
     fft_mag   = np.abs(np.fft.rfft(v_ac * np.hanning(n)))
     fft_freqs = np.fft.rfftfreq(n, d=dt)
-    mask = (fft_freqs >= 0.5e6) & (fft_freqs <= 25e6)
+    mask = fft_freqs > 0  # exclude DC bin only
     if mask.any():
         sub_mag   = fft_mag[mask]
         sub_freqs = fft_freqs[mask]
