@@ -58,8 +58,9 @@ def process_waveform(voltage, dt):
 
     # Frequency: FFT primary (robust against noise, ringing, and low samples/cycle)
     n = len(v_ac)
-    fft_mag = np.abs(np.fft.rfft(v_ac * np.hanning(n)))
-    freqs   = np.fft.rfftfreq(n, d=dt)
+    nfft  = n * 16  # zero-pad for finer frequency grid
+    fft_mag = np.abs(np.fft.rfft(v_ac * np.hanning(n), n=nfft))
+    freqs   = np.fft.rfftfreq(nfft, d=dt)
     mask = freqs > 0  # exclude DC bin only
     if mask.any():
         sub_mag   = fft_mag[mask]
@@ -493,11 +494,13 @@ class ScopeGUI(tk.Tk):
             ch = self._chan.get()
             coup = "AC" if self._ac_var.get() else "DC"
             self._scope.write(f":{ch}:COUP {coup}")
+            self._scope.write(":STOP")          # must stop before RAW mode read
+            time.sleep(0.1)
             self._scope.write(f":WAV:SOUR {ch}")
-            self._scope.write(":WAV:MODE NORM")
+            self._scope.write(":WAV:MODE RAW")
             self._scope.write(":WAV:FORM BYTE")
             self._scope.write(":WAV:STAR 1")
-            self._scope.write(":WAV:STOP 1200")
+            self._scope.write(":WAV:STOP 2048")
 
             preamble    = self._scope.query(":WAV:PRE?").strip().split(",")
             x_increment = float(preamble[4])
@@ -506,8 +509,7 @@ class ScopeGUI(tk.Tk):
             y_origin    = float(preamble[8])
             y_reference = float(preamble[9])
 
-            self._scope.write(":STOP")
-            time.sleep(0.2)
+            time.sleep(0.1)
             self._scope.write(":WAV:DATA?")
             time.sleep(0.2)
             raw = self._scope.read_raw()

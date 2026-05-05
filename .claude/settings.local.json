@@ -10,7 +10,10 @@
       "Bash(/Library/Frameworks/Python.framework/Versions/3.10/bin/python3 -:*)",
       "Bash(.venv/bin/python analyze_waveform.py \"Waveform-1cycle.txt.txt\")",
       "Bash(python analyze_waveform.py 415.txt)",
-      "Bash(python3 -m pytest test_scan_gui.py -v)"
+      "Bash(python3 -m pytest test_scan_gui.py -v)",
+      "Bash(python -c ' *)",
+      "Bash(Get-Item \"c:\\\\Users\\\\sigma\\\\Dropbox\\\\QMS\\\\TEST LABORATORY\\\\3. OPTICS AND ENDOSCOPES\\\\10. TOOLS\\\\Code\\\\MotorControl\\\\scan_results.csv\")",
+      "Bash(Select-Object LastWriteTime)"
     ]
   }
 }

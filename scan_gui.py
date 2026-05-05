@@ -4,10 +4,12 @@
 import csv
 import os
 import queue
+import statistics
 import sys
 import threading
 import time
 import tkinter as tk
+from collections import deque
 from tkinter import filedialog, scrolledtext, ttk
 
 import numpy as np
@@ -40,6 +42,100 @@ from velmex_vp9000 import VP9000
 
 # ── Scan logic (runs in background thread) ───────────────────────────────── #
 
+def _bmode_find_peak(scope, cfg, msg_q, pre=None):
+    """Find the highest trigger level that fires — two passes.
+    Pass 1 (coarse): 0.10 V steps to locate the approximate peak quickly.
+    Pass 2 (fine):   0.02 V steps in a ±0.12 V window around the coarse hit.
+    The highest-amplitude signal is always the one we want; no frequency
+    filtering during the search."""
+    ceiling = min(float(cfg["scope_vdiv"]) * 4.0, 2.0)   # cap at 2 V
+    scope.write(":TRIG:SWE NORM")
+    scope.write(":TRIG:EDGE:SLOP POS")
+
+    msg_q.put({"type": "log", "text":
+        f"B-mode init: coarse scan {ceiling:.2f} V → 0.01 V (0.10 V steps)…"})
+    approx = None
+    v = ceiling
+    while v >= 0.01 - 1e-9:
+        scope.write(f":TRIG:EDGE:LEV {v:.4f}")
+        scope.write(":RUN")
+        time.sleep(0.15)
+        if scope.query(":TRIG:STAT?").strip() == "TD":
+            approx = v
+            break
+        v = round(v - 0.10, 6)
+
+    if approx is None:
+        msg_q.put({"type": "log", "text": "B-mode init: no trigger found — using 0.01 V"})
+        vpeak = 0.01
+    else:
+        # Fine pass in a ±0.12 V window around the coarse hit
+        fine_high = min(approx + 0.12, ceiling)
+        fine_low  = max(approx - 0.12, 0.01)
+        msg_q.put({"type": "log", "text":
+            f"B-mode init: fine scan {fine_high:.3f} V → {fine_low:.3f} V (0.02 V steps)…"})
+        vpeak = fine_low
+        v = fine_high
+        while v >= fine_low - 1e-9:
+            scope.write(f":TRIG:EDGE:LEV {v:.4f}")
+            scope.write(":RUN")
+            time.sleep(0.15)
+            if scope.query(":TRIG:STAT?").strip() == "TD":
+                vpeak = v
+                break
+            v = round(v - 0.02, 6)
+
+    scope.write(f":TRIG:EDGE:LEV {vpeak * cfg['bmode_trig_frac']:.4f}")
+    msg_q.put({"type": "log", "text":
+        f"B-mode init: peak = {vpeak:.4f} V  →  trigger {vpeak * cfg['bmode_trig_frac']:.4f} V"})
+    return vpeak
+
+
+def _bmode_update_peak(scope, cfg, prev_vpeak):
+    """Per-point update: fine scan in a ±window around prev_vpeak (0.02 V steps).
+    No frequency validation — highest firing level is the correct signal."""
+    ceiling = float(cfg["scope_vdiv"]) * 4.0
+    v_high  = min(prev_vpeak + 0.15, ceiling)
+    v_low   = max(prev_vpeak - 0.20, 0.01)
+    scope.write(":TRIG:SWE NORM")
+    vpeak = v_low
+    v = v_high
+    while v >= v_low - 1e-9:
+        scope.write(f":TRIG:EDGE:LEV {v:.4f}")
+        scope.write(":RUN")
+        time.sleep(0.10)
+        if scope.query(":TRIG:STAT?").strip() == "TD":
+            vpeak = v
+            break
+        v = round(v - 0.02, 6)
+    scope.write(f":TRIG:EDGE:LEV {vpeak * cfg['bmode_trig_frac']:.4f}")
+    return vpeak
+
+
+def _arm_and_capture(scope, trig_lev, pre, stop_event=None, timeout=2.0):
+    """Run scope at trig_lev, wait for a clean TD, stop, then capture.
+    Returns None if stop_event fires OR if timeout expires without TD —
+    never reads stale data from a previous trigger event."""
+    if trig_lev is not None:
+        scope.write(f":TRIG:EDGE:LEV {trig_lev:.4f}")
+    scope.write(":TRIG:SWE NORM")
+    scope.write(":RUN")
+    t0 = time.time()
+    triggered = False
+    while time.time() - t0 < timeout:
+        if stop_event is not None and stop_event.is_set():
+            scope.write(":STOP")
+            return None
+        if scope.query(":TRIG:STAT?").strip() == "TD":
+            triggered = True
+            break
+        time.sleep(0.05)
+    scope.write(":STOP")
+    if not triggered:
+        return None   # timed out — do not read stale memory
+    return capture(scope, pre, stop_event=stop_event)
+
+
 def configure_scope(scope, cfg):
     """Apply user-selected scope settings before a scan."""
     scope.write(f":TIM:MODE {cfg['scope_mode']}")
@@ -62,13 +158,13 @@ def setup_scope(scope, channel, ac_coupling=False):
     else:
         scope.write(f":{channel}:COUP DC")
     scope.write(f":WAV:SOUR {channel}")
-    scope.write(":WAV:MODE NORM")
+    scope.write(":WAV:MODE RAW")
     scope.write(":WAV:FORM BYTE")
     scope.write(":WAV:STAR 1")
-    scope.write(":WAV:STOP 1200")
+    scope.write(":WAV:STOP 2048")
     preamble    = scope.query(":WAV:PRE?").strip().split(",")
     return {
-        "n_points":    int(preamble[2]),
+        "n_points":    2048,
         "x_increment": float(preamble[4]),
         "x_origin":    float(preamble[5]),
         "y_increment": float(preamble[7]),
@@ -119,8 +215,9 @@ def capture(scope, pre, stop_event=None):
 
     # Frequency: FFT primary (robust against ringing, reflections, low samples/cycle).
     n = len(v_ac)
-    fft_mag   = np.abs(np.fft.rfft(v_ac * np.hanning(n)))
-    fft_freqs = np.fft.rfftfreq(n, d=dt)
+    nfft      = n * 16  # zero-pad for finer frequency grid
+    fft_mag   = np.abs(np.fft.rfft(v_ac * np.hanning(n), n=nfft))
+    fft_freqs = np.fft.rfftfreq(nfft, d=dt)
     mask = fft_freqs > 0  # exclude DC bin only
     if mask.any():
         sub_mag   = fft_mag[mask]
@@ -230,12 +327,17 @@ def run_scan(cfg, motor, scope, msg_q, stop_event):
         motor.set_speed(cfg["y_motor"], cfg["speed"])
         motor.set_speed(cfg["z_motor"], cfg["speed"])
 
+        def _positions(center, half_range, step):
+            if step == 0 or half_range == 0:
+                return [center]
+            return list(range(center - half_range, center + half_range + step, step))
+
         xh = cfg["x_range"] // 2
         yh = cfg["y_range"] // 2
         zh = cfg["z_range"] // 2
-        x_positions = list(range(cfg["x_center"] - xh, cfg["x_center"] + xh + cfg["x_step"], cfg["x_step"]))
-        y_positions = list(range(cfg["y_center"] - yh, cfg["y_center"] + yh + cfg["y_step"], cfg["y_step"]))
-        z_positions = list(range(cfg["z_center"] - zh, cfg["z_center"] + zh + cfg["z_step"], cfg["z_step"]))
+        x_positions = _positions(cfg["x_center"], xh, cfg["x_step"])
+        y_positions = _positions(cfg["y_center"], yh, cfg["y_step"])
+        z_positions = _positions(cfg["z_center"], zh, cfg["z_step"])
         total = len(x_positions) * len(y_positions) * len(z_positions)
 
         fieldnames = ["x_mm", "y_mm", "z_mm", "v_pp", "v_max", "v_min",
@@ -255,36 +357,89 @@ def run_scan(cfg, motor, scope, msg_q, stop_event):
             writer.writeheader()
 
             done = 0
+            bmode_prev_vpeak  = None
+            bmode_initialized = False
+            vpp_window        = deque(maxlen=5)
             for z in z_positions:
                 if stop_event.is_set():
                     break
-                msg_q.put({"type": "log", "text": f"Moving Z → {z}..."})
-                motor.move_absolute(cfg["z_motor"], z)
-                motor.wait_for_done(stop_event=stop_event)
-                msg_q.put({"type": "log", "text": f"Z at {z}."})
+                if len(z_positions) > 1:
+                    msg_q.put({"type": "log", "text": f"Moving Z → {z}..."})
+                    motor.move_absolute(cfg["z_motor"], z)
+                    motor.wait_for_done(stop_event=stop_event)
+                    msg_q.put({"type": "log", "text": f"Z at {z}."})
 
                 for y in y_positions:
                     if stop_event.is_set():
                         break
-                    msg_q.put({"type": "log", "text": f"  Moving Y → {y}..."})
-                    motor.move_absolute(cfg["y_motor"], y)
-                    motor.wait_for_done(stop_event=stop_event)
-                    msg_q.put({"type": "log", "text": f"  Y at {y}."})
+                    if len(y_positions) > 1:
+                        msg_q.put({"type": "log", "text": f"  Moving Y → {y}..."})
+                        motor.move_absolute(cfg["y_motor"], y)
+                        motor.wait_for_done(stop_event=stop_event)
+                        msg_q.put({"type": "log", "text": f"  Y at {y}."})
 
                     for x in x_positions:
                         if stop_event.is_set():
                             break
-                        msg_q.put({"type": "log", "text": f"    Moving X → {x}..."})
-                        motor.move_absolute(cfg["x_motor"], x)
-                        scope.write(":STOP")  # Stop scope while motor is moving
-                        motor.wait_for_done(stop_event=stop_event)
+                        if len(x_positions) > 1:
+                            msg_q.put({"type": "log", "text": f"    Moving X → {x}..."})
+                            motor.move_absolute(cfg["x_motor"], x)
+                            scope.write(":STOP")
+                            motor.wait_for_done(stop_event=stop_event)
+                        else:
+                            scope.write(":STOP")
                         if stop_event.is_set():
                             break
                         time.sleep(cfg["settle"])
 
-                        stats = capture(scope, pre, stop_event=stop_event)
+                        # Update trigger for current position BEFORE capturing.
+                        # Scope was stopped during the motor move; the update
+                        # runs the scope, validates a trigger here, then we arm
+                        # once more to get a clean settled-position waveform.
+                        if cfg["bmode_trig"]:
+                            if not bmode_initialized:
+                                bmode_prev_vpeak = _bmode_find_peak(scope, cfg, msg_q, pre=pre)
+                                bmode_initialized = True
+                            else:
+                                bmode_prev_vpeak = _bmode_update_peak(scope, cfg, bmode_prev_vpeak)
+                            trig_lev = bmode_prev_vpeak * cfg["bmode_trig_frac"]
+                        else:
+                            trig_lev = None
+
+                        stats = _arm_and_capture(scope, trig_lev, pre, stop_event=stop_event)
                         if stats is None:
-                            break
+                            if stop_event.is_set():
+                                break
+                            msg_q.put({"type": "log", "text":
+                                f"    No trigger at {trig_lev:.4f} V — skipping point"})
+                            continue
+
+                        # Frequency is logged as a quality indicator only;
+                        # we trust the highest-trigger search to have selected
+                        # the correct signal.
+                        exp_freq = cfg.get("bmode_exp_freq", 0)
+                        if (cfg["bmode_trig"] and exp_freq > 0
+                                and stats["frequency"] > 0
+                                and abs(stats["frequency"] - exp_freq) / exp_freq > 0.20):
+                            msg_q.put({"type": "log", "text":
+                                f"    Warning: captured {stats['frequency']/1e6:.2f} MHz"
+                                f" (expected {exp_freq/1e6:.1f} MHz)"
+                                f" at trigger {trig_lev:.4f} V"})
+
+                        if (cfg["bmode_trig"] and len(vpp_window) >= 3
+                                and stats["v_pp"] < statistics.median(vpp_window) * 0.60):
+                            msg_q.put({"type": "log", "text":
+                                f"    Low amplitude {stats['v_pp']:.4f} V"
+                                f" (median {statistics.median(vpp_window):.4f} V)"
+                                f" — re-searching trigger…"})
+                            bmode_prev_vpeak = _bmode_find_peak(scope, cfg, msg_q, pre=pre)
+                            trig_lev = bmode_prev_vpeak * cfg["bmode_trig_frac"]
+                            stats = _arm_and_capture(scope, trig_lev, pre, stop_event=stop_event)
+                            if stats is None:
+                                msg_q.put({"type": "log", "text": "    Still no trigger — skipping point"})
+                                continue
+
+                        vpp_window.append(stats["v_pp"])
                         row = {
                             "x_mm":      x / cfg["x_spmm"],
                             "y_mm":      y / cfg["y_spmm"],
@@ -320,9 +475,12 @@ def run_scan(cfg, motor, scope, msg_q, stop_event):
                 except Exception:
                     pass
             else:
-                motor.move_absolute(cfg["x_motor"], cfg["x_center"])
-                motor.move_absolute(cfg["y_motor"], cfg["y_center"])
-                motor.move_absolute(cfg["z_motor"], cfg["z_center"])
+                if x_positions[-1] != cfg["x_center"]:
+                    motor.move_absolute(cfg["x_motor"], cfg["x_center"])
+                if y_positions[-1] != cfg["y_center"]:
+                    motor.move_absolute(cfg["y_motor"], cfg["y_center"])
+                if z_positions[-1] != cfg["z_center"]:
+                    motor.move_absolute(cfg["z_motor"], cfg["z_center"])
                 motor.wait_for_done(stop_event=stop_event)
 
         msg_q.put({"type": "done", "output": cfg["output"], "aborted": stop_event.is_set()})
@@ -358,10 +516,10 @@ class ScanApp(tk.Tk):
         conn = ttk.LabelFrame(self, text="Connection")
         conn.grid(row=0, column=0, columnspan=2, sticky="ew", **pad)
 
-        self._port = self._row(conn, 0, "Motor port",  "/dev/tty.usbserial-FTEHI1FO")
+        self._port = self._row(conn, 0, "Motor port",  "COM3")
         ttk.Button(conn, text="Find", command=self._find_port).grid(
             row=0, column=2, padx=(0, 8), pady=2, sticky="w")
-        self._visa = self._row(conn, 1, "Scope VISA",  "USB0::6833::1303::DS1ZE278M01562::0::INSTR")
+        self._visa = self._row(conn, 1, "Scope VISA",  "USB0::0x1AB1::0x0517::DS1ZE278M01562::INSTR")
         ttk.Button(conn, text="Find", command=self._find_visa).grid(
             row=1, column=2, padx=(0, 8), pady=2, sticky="w")
         self._chan = self._row(conn, 2, "Channel",     "CHAN1")
@@ -371,7 +529,7 @@ class ScanApp(tk.Tk):
             row=2, column=2, padx=8, sticky="w")
 
         ttk.Label(conn, text="Lab").grid(row=3, column=0, sticky="w", padx=6, pady=2)
-        self._lab = tk.StringVar(value="Optics Lab (160 steps/mm)")
+        self._lab = tk.StringVar(value="Acoustics Lab (200 steps/mm)")
         ttk.Combobox(conn, textvariable=self._lab,
                      values=["Optics Lab (160 steps/mm)", "Acoustics Lab (200 steps/mm)"],
                      state="readonly", width=28).grid(row=3, column=1, sticky="w", padx=6, pady=2)
@@ -442,6 +600,9 @@ class ScanApp(tk.Tk):
         self._sc_trig_src = tk.StringVar(value="CHAN1")
         self._sc_trig_lev = tk.StringVar(value="0.0")
         self._sc_holdoff  = tk.StringVar(value="1e-7")
+        self._bmode_trig      = tk.BooleanVar(value=False)
+        self._bmode_trig_frac = tk.StringVar(value="0.90")
+        self._bmode_exp_freq  = tk.StringVar(value="0")
 
         _sc_combo(sc, 0, 0, "Mode",         self._sc_mode,     ["MAIN","XY","ROLL"])
         _sc_entry(sc, 0, 1, "s/div",         self._sc_sdiv)
@@ -454,9 +615,14 @@ class ScanApp(tk.Tk):
         _sc_entry(sc, 2, 1, "Trig level (V)",self._sc_trig_lev)
         _sc_entry(sc, 2, 2, "Holdoff (s)",   self._sc_holdoff)
 
+        ttk.Checkbutton(sc, text="B-mode auto-trig", variable=self._bmode_trig).grid(
+            row=3, column=0, columnspan=2, sticky="w", padx=(8, 2), pady=3)
+        _sc_entry(sc, 3, 1, "Trig fraction",    self._bmode_trig_frac, width=6)
+        _sc_entry(sc, 3, 2, "Expected freq (MHz)", self._bmode_exp_freq, width=6)
+
         self._apply_scope_btn = ttk.Button(sc, text="Apply Now",
                                            command=self._apply_scope_cfg, state="disabled")
-        self._apply_scope_btn.grid(row=3, column=0, columnspan=6, pady=(2, 4))
+        self._apply_scope_btn.grid(row=4, column=0, columnspan=6, pady=(2, 4))
 
         # ── Output ───────────────────────────────────────────────────────── #
         out = ttk.LabelFrame(self, text="Output")
@@ -564,8 +730,8 @@ class ScanApp(tk.Tk):
     def _axis_row(self, parent, r, axis):
         ttk.Label(parent, text=axis).grid(row=r, column=0, padx=6, pady=2)
         defaults = {
-            "X": ("0", "30",  "3"),
-            "Y": ("0", "30",  "3"),
+            "X": ("0", "4",   "0.1"),
+            "Y": ("0", "0",   "3"),
             "Z": ("0", "0",   "0.25"),
         }
         vs = []
@@ -592,9 +758,14 @@ class ScanApp(tk.Tk):
 
     # ── Connection control ───────────────────────────────────────────────── #
 
+    @staticmethod
+    def _f(var):
+        return float(var.get().replace(",", "."))
+
     def _collect_cfg(self):
         lab_spmm = {"Optics Lab (160 steps/mm)": 160, "Acoustics Lab (200 steps/mm)": 200}
         spmm = lab_spmm[self._lab.get()]
+        f = self._f
         return {
             "port":     self._port.get(),
             "visa":     self._visa.get(),
@@ -609,19 +780,19 @@ class ScanApp(tk.Tk):
             "y_motor":  int(self._ym.get()),
             "z_motor":  int(self._zm.get()),
             "speed":    int(self._spd.get()),
-            "settle":   float(self._set.get()),
+            "settle":   f(self._set),
             "x_spmm":   spmm,
             "y_spmm":   spmm,
             "z_spmm":   spmm,
-            "x_center": int(round(float(self._xc.get())  * spmm)),
-            "x_range":  int(round(float(self._xr.get())  * spmm)),
-            "x_step":   int(round(float(self._xst.get()) * spmm)),
-            "y_center": int(round(float(self._yc.get())  * spmm)),
-            "y_range":  int(round(float(self._yr.get())  * spmm)),
-            "y_step":   int(round(float(self._yst.get()) * spmm)),
-            "z_center": int(round(float(self._zc.get())  * spmm)),
-            "z_range":  int(round(float(self._zr.get())  * spmm)),
-            "z_step":   int(round(float(self._zst.get()) * spmm)),
+            "x_center": int(round(f(self._xc)  * spmm)),
+            "x_range":  int(round(f(self._xr)  * spmm)),
+            "x_step":   int(round(f(self._xst) * spmm)),
+            "y_center": int(round(f(self._yc)  * spmm)),
+            "y_range":  int(round(f(self._yr)  * spmm)),
+            "y_step":   int(round(f(self._yst) * spmm)),
+            "z_center": int(round(f(self._zc)  * spmm)),
+            "z_range":  int(round(f(self._zr)  * spmm)),
+            "z_step":   int(round(f(self._zst) * spmm)),
             # scope config
             "scope_mode":     self._sc_mode.get(),
             "scope_sdiv":     self._sc_sdiv.get(),
@@ -632,6 +803,9 @@ class ScanApp(tk.Tk):
             "scope_trig_src": self._sc_trig_src.get(),
             "scope_trig_lev": self._sc_trig_lev.get(),
             "scope_holdoff":  self._sc_holdoff.get(),
+            "bmode_trig":      self._bmode_trig.get(),
+            "bmode_trig_frac": f(self._bmode_trig_frac),
+            "bmode_exp_freq":  f(self._bmode_exp_freq) * 1e6,
         }
 
     def _connect(self):
