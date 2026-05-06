@@ -4,12 +4,10 @@
 import csv
 import os
 import queue
-import statistics
 import sys
 import threading
 import time
 import tkinter as tk
-from collections import deque
 from tkinter import filedialog, scrolledtext, ttk
 
 import numpy as np
@@ -39,77 +37,156 @@ _CAL_FREQS, _CAL_FACTORS = _load_cal_table()
 
 from velmex_vp9000 import VP9000
 
+# Standard Rigol V/div steps (volts)
+_VDIV_STEPS = [0.001, 0.002, 0.005, 0.010, 0.020, 0.050,
+               0.100, 0.200, 0.500, 1.0, 2.0, 5.0, 10.0]
+
+
+def _best_vdiv(v_pp, n_divs=8, fill=0.85):
+    """Smallest standard V/div that fits v_pp within fill*screen without clipping."""
+    target = v_pp / (n_divs * fill)
+    for step in _VDIV_STEPS:
+        if step >= target:
+            return step
+    return _VDIV_STEPS[-1]
+
 
 # ── Scan logic (runs in background thread) ───────────────────────────────── #
 
 def _bmode_find_peak(scope, cfg, msg_q, pre=None):
-    """Find the highest trigger level that fires — two passes.
-    Pass 1 (coarse): 0.10 V steps to locate the approximate peak quickly.
-    Pass 2 (fine):   0.02 V steps in a ±0.12 V window around the coarse hit.
-    The highest-amplitude signal is always the one we want; no frequency
-    filtering during the search."""
-    ceiling = min(float(cfg["scope_vdiv"]) * 4.0, 2.0)   # cap at 2 V
+    """Find the highest trigger level that fires with the correct signal.
+    Single linear scan: 0.10 V steps above 0.12 V, 0.02 V steps below.
+    This covers weak signals (< 0.10 V peak) that the old coarse scan missed.
+    When bmode_exp_freq is set each fired level is captured and frequency-checked;
+    the scan continues lower if the hit is a spurious signal."""
+    # Restore the user's initial V/div before searching so the trigger ceiling
+    # is never artificially constrained by a previous autoscale-down.
+    vdiv_wide = float(cfg.get("scope_vdiv_init", cfg["scope_vdiv"]))
+    if float(cfg["scope_vdiv"]) != vdiv_wide:
+        scope.write(f":{cfg['channel']}:SCAL {vdiv_wide:.4f}")
+        time.sleep(0.30)
+        cfg["scope_vdiv"] = vdiv_wide
+    # Always re-read preamble to match the restored V/div — the passed-in pre
+    # may be from a different (autoscaled) V/div and would give wrong voltages.
+    pre = setup_scope(scope, cfg["channel"], ac_coupling=cfg.get("ac_coupling", False))
+    ceiling  = min(vdiv_wide * 4.0, 2.0)
+    exp_freq = float(cfg.get("bmode_exp_freq", 0))
+
     scope.write(":TRIG:SWE NORM")
     scope.write(":TRIG:EDGE:SLOP POS")
-
     msg_q.put({"type": "log", "text":
-        f"B-mode init: coarse scan {ceiling:.2f} V → 0.01 V (0.10 V steps)…"})
-    approx = None
+        f"B-mode: scanning {ceiling:.2f} → 0.01 V…"})
+
+    def _wait_for_td(timeout=0.6):
+        """Poll TRIG:STAT? for up to timeout seconds; return True if TD seen."""
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            if scope.query(":TRIG:STAT?").strip() == "TD":
+                return True
+            time.sleep(0.05)
+        return False
+
+    vpeak = None
     v = ceiling
     while v >= 0.01 - 1e-9:
         scope.write(f":TRIG:EDGE:LEV {v:.4f}")
         scope.write(":RUN")
-        time.sleep(0.15)
-        if scope.query(":TRIG:STAT?").strip() == "TD":
-            approx = v
-            break
-        v = round(v - 0.10, 6)
-
-    if approx is None:
-        msg_q.put({"type": "log", "text": "B-mode init: no trigger found — using 0.01 V"})
-        vpeak = 0.01
-    else:
-        # Fine pass in a ±0.12 V window around the coarse hit
-        fine_high = min(approx + 0.12, ceiling)
-        fine_low  = max(approx - 0.12, 0.01)
-        msg_q.put({"type": "log", "text":
-            f"B-mode init: fine scan {fine_high:.3f} V → {fine_low:.3f} V (0.02 V steps)…"})
-        vpeak = fine_low
-        v = fine_high
-        while v >= fine_low - 1e-9:
-            scope.write(f":TRIG:EDGE:LEV {v:.4f}")
-            scope.write(":RUN")
-            time.sleep(0.15)
-            if scope.query(":TRIG:STAT?").strip() == "TD":
-                vpeak = v
+        if _wait_for_td(timeout=0.6):
+            if exp_freq > 0 and pre is not None:
+                # Capture and verify frequency before accepting this level.
+                scope.write(":STOP")
+                time.sleep(0.05)
+                test = capture(scope, pre)
+                if test and test["frequency"] > 0:
+                    msg_q.put({"type": "log", "text":
+                        f"  v={v:.3f} V → {test['frequency']/1e6:.2f} MHz"})
+                    if abs(test["frequency"] - exp_freq) / exp_freq <= 0.25:
+                        vpeak = v
+                        break     # correct frequency found
+                    # Wrong frequency — spurious signal at this level; keep going
+                else:
+                    vpeak = v     # capture failed; accept level without freq check
+                    break
+            else:
+                vpeak = v         # no freq check — highest firing level wins
                 break
-            v = round(v - 0.02, 6)
+        # Coarse step above 0.12 V; fine step below to catch weak signals
+        v = round(v - (0.10 if v > 0.12 else 0.02), 6)
 
-    scope.write(f":TRIG:EDGE:LEV {vpeak * cfg['bmode_trig_frac']:.4f}")
+    if vpeak is None:
+        msg_q.put({"type": "log", "text":
+            "B-mode: no trigger found — defaulting to 0.02 V"})
+        vpeak = 0.02
+
+    trig = vpeak * cfg["bmode_trig_frac"]
+    scope.write(f":TRIG:EDGE:LEV {trig:.4f}")
     msg_q.put({"type": "log", "text":
-        f"B-mode init: peak = {vpeak:.4f} V  →  trigger {vpeak * cfg['bmode_trig_frac']:.4f} V"})
+        f"B-mode: peak = {vpeak:.4f} V  →  trigger {trig:.4f} V"})
     return vpeak
 
 
-def _bmode_update_peak(scope, cfg, prev_vpeak):
+def _bmode_update_peak(scope, cfg, msg_q, prev_vpeak, pre=None):
     """Per-point update: fine scan in a ±window around prev_vpeak (0.02 V steps).
-    No frequency validation — highest firing level is the correct signal."""
-    ceiling = float(cfg["scope_vdiv"]) * 4.0
-    v_high  = min(prev_vpeak + 0.15, ceiling)
-    v_low   = max(prev_vpeak - 0.20, 0.01)
+    Always restores vdiv_wide before searching so the ceiling is never constrained
+    by a previous autoscale — otherwise a shrunken V/div causes the found level to
+    reflect the ceiling, not the signal peak, which then drives autoscale too small.
+    When bmode_exp_freq is set, each fired level is frequency-checked just like
+    _bmode_find_peak — spurious lines are skipped rather than accepted.
+    Falls back to a full scan if the correct signal is not found in the window."""
+    # Restore wide V/div so found value is always a reliable amplitude estimate
+    vdiv_wide = float(cfg.get("scope_vdiv_init", cfg["scope_vdiv"]))
+    if float(cfg["scope_vdiv"]) != vdiv_wide:
+        scope.write(f":{cfg['channel']}:SCAL {vdiv_wide:.4f}")
+        time.sleep(0.20)
+        cfg["scope_vdiv"] = vdiv_wide
+        pre = setup_scope(scope, cfg["channel"], ac_coupling=cfg.get("ac_coupling", False))
+    ceiling  = min(vdiv_wide * 4.0, 2.0)
+    v_high   = min(prev_vpeak + 0.15, ceiling)
+    v_low    = max(prev_vpeak - 0.20, 0.01)
+    exp_freq = float(cfg.get("bmode_exp_freq", 0))
     scope.write(":TRIG:SWE NORM")
-    vpeak = v_low
+    found = None
     v = v_high
     while v >= v_low - 1e-9:
         scope.write(f":TRIG:EDGE:LEV {v:.4f}")
         scope.write(":RUN")
-        time.sleep(0.10)
-        if scope.query(":TRIG:STAT?").strip() == "TD":
-            vpeak = v
-            break
+        # Poll for up to 0.4 s so slow B-mode scanners (≥ 2.5 Hz per line) are caught
+        t0 = time.time()
+        fired = False
+        while time.time() - t0 < 0.40:
+            if scope.query(":TRIG:STAT?").strip() == "TD":
+                fired = True
+                break
+            time.sleep(0.05)
+        if fired:
+            if exp_freq > 0 and pre is not None:
+                scope.write(":STOP")
+                time.sleep(0.05)
+                test = capture(scope, pre)
+                if test and test["frequency"] > 0:
+                    if abs(test["frequency"] - exp_freq) / exp_freq <= 0.25:
+                        found = v
+                        break
+                    # Wrong frequency — spurious B-mode line; keep scanning lower
+                else:
+                    found = v   # capture failed; accept without freq check
+                    break
+            else:
+                found = v
+                break
         v = round(v - 0.02, 6)
-    scope.write(f":TRIG:EDGE:LEV {vpeak * cfg['bmode_trig_frac']:.4f}")
-    return vpeak
+    if found is None:
+        msg_q.put({"type": "log", "text":
+            "    B-mode: signal left tracking window — running full scan…"})
+        return _bmode_find_peak(scope, cfg, msg_q)
+    # If found is right at the window top, the true peak is higher than the window
+    # allows. Fall back to a full scan so autoscale gets the real amplitude.
+    if abs(found - v_high) < 1e-9:
+        msg_q.put({"type": "log", "text":
+            "    B-mode: signal at window top — running full scan for accurate peak…"})
+        return _bmode_find_peak(scope, cfg, msg_q)
+    scope.write(f":TRIG:EDGE:LEV {found * cfg['bmode_trig_frac']:.4f}")
+    return found
 
 
 def _arm_and_capture(scope, trig_lev, pre, stop_event=None, timeout=2.0):
@@ -143,6 +220,7 @@ def configure_scope(scope, cfg):
     scope.write(f":TIM:OFFS {cfg['scope_delay']}")
     ch = cfg["channel"]
     scope.write(f":{ch}:SCAL {cfg['scope_vdiv']}")
+    scope.write(f":{ch}:OFFS 0")   # reset any manual vertical offset from prior use
     scope.write(f":ACQ:TYPE {cfg['scope_acq_type']}")
     scope.write(f":ACQ:MDEP {cfg['scope_mdep']}")
     scope.write(":TRIG:MODE EDGE")
@@ -162,7 +240,10 @@ def setup_scope(scope, channel, ac_coupling=False):
     scope.write(":WAV:FORM BYTE")
     scope.write(":WAV:STAR 1")
     scope.write(":WAV:STOP 2048")
-    preamble    = scope.query(":WAV:PRE?").strip().split(",")
+    preamble = scope.query(":WAV:PRE?").strip().split(",")
+    if float(preamble[4]) == 0:   # scope mid-acquisition — retry once
+        time.sleep(0.15)
+        preamble = scope.query(":WAV:PRE?").strip().split(",")
     return {
         "n_points":    2048,
         "x_increment": float(preamble[4]),
@@ -180,6 +261,11 @@ def capture(scope, pre, stop_event=None):
     """Scope already stopped by caller. Read waveform using cached preamble.
     Returns None if stop_event fires during the wait."""
     global _first_capture
+
+    dt = pre["x_increment"]
+    if dt <= 0:
+        scope.write(":RUN")
+        return None
 
     scope.write(":WAV:DATA?")
     # 0.2 s wait in small steps so stop_event can interrupt
@@ -200,6 +286,9 @@ def capture(scope, pre, stop_event=None):
         raw_bytes += scope.read_raw()
 
     raw = np.frombuffer(raw_bytes[data_start:data_start + n_data], dtype=np.uint8)
+    if len(raw) == 0:
+        scope.write(":RUN")
+        return None
     voltage = (raw - pre["y_reference"]) * pre["y_increment"] + pre["y_origin"]
 
     if _first_capture:
@@ -210,7 +299,6 @@ def capture(scope, pre, stop_event=None):
 
     scope.write(":RUN")
 
-    dt = pre["x_increment"]
     v_ac = voltage - voltage.mean()   # remove DC for RMS / PII, matching scope behaviour
 
     # Frequency: FFT primary (robust against ringing, reflections, low samples/cycle).
@@ -225,8 +313,12 @@ def capture(scope, pre, stop_event=None):
         peak_i    = int(np.argmax(sub_mag))
         if 0 < peak_i < len(sub_mag) - 1:
             alpha, beta, gamma = sub_mag[peak_i-1], sub_mag[peak_i], sub_mag[peak_i+1]
-            correction = 0.5 * (alpha - gamma) / (alpha - 2*beta + gamma)
-            fft_freq = sub_freqs[peak_i] + correction * (sub_freqs[1] - sub_freqs[0])
+            denom = alpha - 2*beta + gamma
+            if abs(denom) > 1e-12:
+                correction = 0.5 * (alpha - gamma) / denom
+                fft_freq = sub_freqs[peak_i] + correction * (sub_freqs[1] - sub_freqs[0])
+            else:
+                fft_freq = sub_freqs[peak_i]
         else:
             fft_freq = sub_freqs[peak_i]
     else:
@@ -334,10 +426,16 @@ def run_scan(cfg, motor, scope, msg_q, stop_event):
 
         xh = cfg["x_range"] // 2
         yh = cfg["y_range"] // 2
-        zh = cfg["z_range"] // 2
         x_positions = _positions(cfg["x_center"], xh, cfg["x_step"])
         y_positions = _positions(cfg["y_center"], yh, cfg["y_step"])
-        z_positions = _positions(cfg["z_center"], zh, cfg["z_step"])
+
+        # Z is start → stop (unidirectional); handle both directions
+        zs, ze, zst = cfg["z_start"], cfg["z_stop"], cfg["z_step"]
+        if zst == 0 or zs == ze:
+            z_positions = [zs]
+        else:
+            direction = 1 if ze >= zs else -1
+            z_positions = list(range(zs, ze + direction * zst, direction * zst))
         total = len(x_positions) * len(y_positions) * len(z_positions)
 
         fieldnames = ["x_mm", "y_mm", "z_mm", "v_pp", "v_max", "v_min",
@@ -346,9 +444,11 @@ def run_scan(cfg, motor, scope, msg_q, stop_event):
         msg_q.put({"type": "log", "text": "Configuring scope..."})
         configure_scope(scope, cfg)
         pre = setup_scope(scope, cfg["channel"], ac_coupling=cfg["ac_coupling"])
+        cfg["scope_vdiv_init"] = float(cfg["scope_vdiv"])  # wide range kept for B-mode search
         msg_q.put({"type": "log", "text":
             f"Scope preamble: y_inc={pre['y_increment']:.6g} V/cnt  "
-            f"y_origin={pre['y_origin']:.4g} V  y_ref={pre['y_reference']:.4g} cnt"})
+            f"y_origin={pre['y_origin']:.4g} V  y_ref={pre['y_reference']:.4g} cnt  "
+            f"dt={pre['x_increment']:.3g} s"})
 
         msg_q.put({"type": "log", "text": f"Starting scan — {total} points."})
 
@@ -359,7 +459,6 @@ def run_scan(cfg, motor, scope, msg_q, stop_event):
             done = 0
             bmode_prev_vpeak  = None
             bmode_initialized = False
-            vpp_window        = deque(maxlen=5)
             for z in z_positions:
                 if stop_event.is_set():
                     break
@@ -368,6 +467,9 @@ def run_scan(cfg, motor, scope, msg_q, stop_event):
                     motor.move_absolute(cfg["z_motor"], z)
                     motor.wait_for_done(stop_event=stop_event)
                     msg_q.put({"type": "log", "text": f"Z at {z}."})
+                # Amplitude changes significantly between Z levels — force a
+                # fresh peak search at the first point of every Z slice.
+                bmode_initialized = False
 
                 for y in y_positions:
                     if stop_event.is_set():
@@ -401,10 +503,34 @@ def run_scan(cfg, motor, scope, msg_q, stop_event):
                                 bmode_prev_vpeak = _bmode_find_peak(scope, cfg, msg_q, pre=pre)
                                 bmode_initialized = True
                             else:
-                                bmode_prev_vpeak = _bmode_update_peak(scope, cfg, bmode_prev_vpeak)
+                                bmode_prev_vpeak = _bmode_update_peak(scope, cfg, msg_q, bmode_prev_vpeak, pre=pre)
                             trig_lev = bmode_prev_vpeak * cfg["bmode_trig_frac"]
+                            # Autoscale V/div using vpeak as amplitude estimate.
+                            # Done here (not after capture) so we scale based on
+                            # the verified correct signal, not a potentially-bad capture.
+                            if cfg.get("autoscale_vdiv") and bmode_prev_vpeak > 0.02:
+                                estimated_vpp = bmode_prev_vpeak * 2.0
+                                # Floor at 50 mV/div — prevents autoscale from
+                                # setting absurdly small V/div on noise/fallback.
+                                new_vdiv = max(_best_vdiv(estimated_vpp), 0.050)
+                                if new_vdiv != float(cfg["scope_vdiv"]):
+                                    scope.write(f":{cfg['channel']}:SCAL {new_vdiv:.4f}")
+                                    time.sleep(0.30)
+                                    old_vdiv = cfg["scope_vdiv"]
+                                    cfg["scope_vdiv"] = new_vdiv
+                                    pre = setup_scope(scope, cfg["channel"],
+                                                      ac_coupling=cfg["ac_coupling"])
+                                    msg_q.put({"type": "log", "text":
+                                        f"    Autoscale: V/div {float(old_vdiv)*1000:.0f} mV"
+                                        f" → {new_vdiv*1000:.0f} mV"
+                                        f"  (peak ≈ {bmode_prev_vpeak*1000:.0f} mV)"})
                         else:
                             trig_lev = None
+
+                        # Re-read preamble after B-mode search / autoscale since
+                        # V/div may have changed inside _bmode_find_peak.
+                        pre = setup_scope(scope, cfg["channel"],
+                                          ac_coupling=cfg["ac_coupling"])
 
                         stats = _arm_and_capture(scope, trig_lev, pre, stop_event=stop_event)
                         if stats is None:
@@ -414,32 +540,37 @@ def run_scan(cfg, motor, scope, msg_q, stop_event):
                                 f"    No trigger at {trig_lev:.4f} V — skipping point"})
                             continue
 
-                        # Frequency is logged as a quality indicator only;
-                        # we trust the highest-trigger search to have selected
-                        # the correct signal.
+                        # Frequency gate: if the capture landed on a spurious
+                        # B-mode line, retry at the same trigger level — a
+                        # different B-mode line may fire next time.
+                        # When Expected freq = 0 this block is skipped entirely.
                         exp_freq = cfg.get("bmode_exp_freq", 0)
                         if (cfg["bmode_trig"] and exp_freq > 0
                                 and stats["frequency"] > 0
-                                and abs(stats["frequency"] - exp_freq) / exp_freq > 0.20):
+                                and abs(stats["frequency"] - exp_freq) / exp_freq > 0.25):
                             msg_q.put({"type": "log", "text":
-                                f"    Warning: captured {stats['frequency']/1e6:.2f} MHz"
-                                f" (expected {exp_freq/1e6:.1f} MHz)"
-                                f" at trigger {trig_lev:.4f} V"})
-
-                        if (cfg["bmode_trig"] and len(vpp_window) >= 3
-                                and stats["v_pp"] < statistics.median(vpp_window) * 0.60):
-                            msg_q.put({"type": "log", "text":
-                                f"    Low amplitude {stats['v_pp']:.4f} V"
-                                f" (median {statistics.median(vpp_window):.4f} V)"
-                                f" — re-searching trigger…"})
-                            bmode_prev_vpeak = _bmode_find_peak(scope, cfg, msg_q, pre=pre)
-                            trig_lev = bmode_prev_vpeak * cfg["bmode_trig_frac"]
-                            stats = _arm_and_capture(scope, trig_lev, pre, stop_event=stop_event)
-                            if stats is None:
-                                msg_q.put({"type": "log", "text": "    Still no trigger — skipping point"})
+                                f"    Freq {stats['frequency']/1e6:.2f} MHz"
+                                f" ≠ {exp_freq/1e6:.1f} MHz — retrying…"})
+                            freq_ok = False
+                            for _attempt in range(5):
+                                if stop_event.is_set():
+                                    break
+                                rs = _arm_and_capture(scope, trig_lev, pre,
+                                                      stop_event=stop_event)
+                                if rs is None:
+                                    break
+                                if (rs["frequency"] > 0
+                                        and abs(rs["frequency"] - exp_freq)
+                                        / exp_freq <= 0.25):
+                                    stats = rs
+                                    freq_ok = True
+                                    break
+                            if not freq_ok:
+                                msg_q.put({"type": "log", "text":
+                                    f"    Freq gate: correct signal not found"
+                                    f" — skipping point"})
                                 continue
 
-                        vpp_window.append(stats["v_pp"])
                         row = {
                             "x_mm":      x / cfg["x_spmm"],
                             "y_mm":      y / cfg["y_spmm"],
@@ -479,8 +610,8 @@ def run_scan(cfg, motor, scope, msg_q, stop_event):
                     motor.move_absolute(cfg["x_motor"], cfg["x_center"])
                 if y_positions[-1] != cfg["y_center"]:
                     motor.move_absolute(cfg["y_motor"], cfg["y_center"])
-                if z_positions[-1] != cfg["z_center"]:
-                    motor.move_absolute(cfg["z_motor"], cfg["z_center"])
+                if z_positions[-1] != cfg["z_start"]:
+                    motor.move_absolute(cfg["z_motor"], cfg["z_start"])
                 motor.wait_for_done(stop_event=stop_event)
 
         msg_q.put({"type": "done", "output": cfg["output"], "aborted": stop_event.is_set()})
@@ -575,7 +706,19 @@ class ScanApp(tk.Tk):
 
         self._xc, self._xr, self._xst = self._axis_row(grid, 1, "X")
         self._yc, self._yr, self._yst = self._axis_row(grid, 2, "Y")
-        self._zc, self._zr, self._zst = self._axis_row(grid, 3, "Z")
+
+        # Z uses start → stop (unidirectional) to avoid hitting the transducer
+        ttk.Label(grid, text="Z").grid(row=3, column=0, padx=6, pady=2)
+        ttk.Label(grid, text="Start(mm)", width=9).grid(row=3, column=1)
+        ttk.Label(grid, text="Stop(mm)",  width=9).grid(row=3, column=2)
+        ttk.Label(grid, text="Step(mm)",  width=9).grid(row=3, column=3)
+        ttk.Label(grid, text="").grid(row=4, column=0)   # spacer keeps row visible
+        self._zstart = tk.StringVar(value="0")
+        self._zstop  = tk.StringVar(value="30")
+        self._zst    = tk.StringVar(value="0.25")
+        ttk.Entry(grid, textvariable=self._zstart, width=8).grid(row=4, column=1, padx=4, pady=2)
+        ttk.Entry(grid, textvariable=self._zstop,  width=8).grid(row=4, column=2, padx=4, pady=2)
+        ttk.Entry(grid, textvariable=self._zst,    width=8).grid(row=4, column=3, padx=4, pady=2)
 
         # ── Scope Config ─────────────────────────────────────────────────── #
         sc = ttk.LabelFrame(self, text="Scope Config")
@@ -603,6 +746,7 @@ class ScanApp(tk.Tk):
         self._bmode_trig      = tk.BooleanVar(value=False)
         self._bmode_trig_frac = tk.StringVar(value="0.90")
         self._bmode_exp_freq  = tk.StringVar(value="0")
+        self._autoscale_vdiv  = tk.BooleanVar(value=True)
 
         _sc_combo(sc, 0, 0, "Mode",         self._sc_mode,     ["MAIN","XY","ROLL"])
         _sc_entry(sc, 0, 1, "s/div",         self._sc_sdiv)
@@ -619,10 +763,12 @@ class ScanApp(tk.Tk):
             row=3, column=0, columnspan=2, sticky="w", padx=(8, 2), pady=3)
         _sc_entry(sc, 3, 1, "Trig fraction",    self._bmode_trig_frac, width=6)
         _sc_entry(sc, 3, 2, "Expected freq (MHz)", self._bmode_exp_freq, width=6)
+        ttk.Checkbutton(sc, text="Auto V/div", variable=self._autoscale_vdiv).grid(
+            row=4, column=0, sticky="w", padx=(8, 2), pady=3)
 
         self._apply_scope_btn = ttk.Button(sc, text="Apply Now",
                                            command=self._apply_scope_cfg, state="disabled")
-        self._apply_scope_btn.grid(row=4, column=0, columnspan=6, pady=(2, 4))
+        self._apply_scope_btn.grid(row=5, column=0, columnspan=6, pady=(2, 4))
 
         # ── Output ───────────────────────────────────────────────────────── #
         out = ttk.LabelFrame(self, text="Output")
@@ -732,7 +878,6 @@ class ScanApp(tk.Tk):
         defaults = {
             "X": ("0", "4",   "0.1"),
             "Y": ("0", "0",   "3"),
-            "Z": ("0", "0",   "0.25"),
         }
         vs = []
         for c, val in enumerate(defaults[axis], start=1):
@@ -790,22 +935,23 @@ class ScanApp(tk.Tk):
             "y_center": int(round(f(self._yc)  * spmm)),
             "y_range":  int(round(f(self._yr)  * spmm)),
             "y_step":   int(round(f(self._yst) * spmm)),
-            "z_center": int(round(f(self._zc)  * spmm)),
-            "z_range":  int(round(f(self._zr)  * spmm)),
-            "z_step":   int(round(f(self._zst) * spmm)),
-            # scope config
+            "z_start":  int(round(f(self._zstart) * spmm)),
+            "z_stop":   int(round(f(self._zstop)  * spmm)),
+            "z_step":   int(round(f(self._zst)    * spmm)),
+            # scope config — numeric fields use f() so comma decimals work
             "scope_mode":     self._sc_mode.get(),
-            "scope_sdiv":     self._sc_sdiv.get(),
-            "scope_delay":    self._sc_delay.get(),
-            "scope_vdiv":     self._sc_vdiv.get(),
+            "scope_sdiv":     f(self._sc_sdiv),
+            "scope_delay":    f(self._sc_delay),
+            "scope_vdiv":     f(self._sc_vdiv),
             "scope_acq_type": self._sc_acq_type.get(),
             "scope_mdep":     self._sc_mdep.get(),
             "scope_trig_src": self._sc_trig_src.get(),
-            "scope_trig_lev": self._sc_trig_lev.get(),
-            "scope_holdoff":  self._sc_holdoff.get(),
+            "scope_trig_lev": f(self._sc_trig_lev),
+            "scope_holdoff":  f(self._sc_holdoff),
             "bmode_trig":      self._bmode_trig.get(),
             "bmode_trig_frac": f(self._bmode_trig_frac),
             "bmode_exp_freq":  f(self._bmode_exp_freq) * 1e6,
+            "autoscale_vdiv":  self._autoscale_vdiv.get(),
         }
 
     def _connect(self):
@@ -932,7 +1078,7 @@ class ScanApp(tk.Tk):
                     self._connect_btn.config(state="normal")
 
                 elif t == "progress":
-                    pct = msg["done"] / msg["total"] * 100
+                    pct = msg["done"] / msg["total"] * 100 if msg["total"] > 0 else 0
                     self._progress["value"] = pct
                     self._status_var.set(
                         f"[{msg['done']}/{msg['total']}]  "
