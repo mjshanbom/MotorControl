@@ -219,23 +219,44 @@ def _thread_capture(self):
     # ─────────────────────────────────────────────────────────
 
     def _poll(self):
-        try:
-            while True:
-                msg = self._q.get_nowait()
+    try:
+        while True:
+            msg = self._q.get_nowait()
+            t = msg["type"]
 
-                if msg[0] == "status":
-                    self._status.set(msg[1])
+            if t == "connected":
+                self._conn_lbl.config(text=f"Connected: {msg['idn']}", fg="#66FF88")
+                self._btn_conn.config(state=tk.DISABLED)
+                self._btn_disc.config(state=tk.NORMAL)
+                for b in self._all_btns:
+                    b.config(state=tk.NORMAL)
+                self._status.set(f"Connected: {msg['idn']}")
 
-                elif msg[0] == "plot":
-                    t, v = msg[1], msg[2]
-                    self._ax.clear()
-                    self._ax.plot(t, v)
-                    self._canvas.draw()
+            elif t == "conn_reenable":
+                self._btn_conn.config(state=tk.NORMAL)
 
-        except queue.Empty:
-            pass
+            elif t == "status":
+                self._status.set(msg["text"])
 
-        self.after(100, self._poll)
+            elif t == "error":
+                self._status.set(f"Error: {msg['text']}")
+
+            elif t == "capture":
+                self._last_capture = (msg["v"], msg["dt"], msg["x_origin"], msg["results"])
+                self._update_plot(msg["t"], msg["v"])
+                self._update_results(msg["results"])
+                self._btn_capture.config(state=tk.NORMAL)
+                self._btn_save.config(state=tk.NORMAL)
+                self._status.set("Capture complete.")
+
+            elif t == "capture_done":
+                self._btn_capture.config(state=tk.NORMAL)
+
+    except queue.Empty:
+        pass
+
+    # 🔥 THIS LINE IS CRITICAL
+    self.after(100, self._poll)
 
 
 # ─────────────────────────────────────────────────────────────
