@@ -239,12 +239,15 @@ def _arm_and_capture(scope, trig_lev, pre, stop_event=None, timeout=2.0):
 # ── Multi-capture ─────────────────────────────────────────────────────────── #
 
 def _multi_capture(scope, trig_lev, pre, min_n, max_attempts,
-                   consistency_frac, msg_q, stop_event, timeout=2.0):
+                   consistency_frac, msg_q, stop_event, timeout=2.0,
+                   min_signal_vpp=0.0):
     """Collect min_n consistent waveforms, returning the one with highest v_pp.
 
-    Each accepted capture must have v_pp >= consistency_frac * previous accepted
-    v_pp. Rejected captures do NOT update the baseline, so a single misfire can't
-    drag down the threshold for later captures.
+    Each accepted capture must have v_pp >= min_signal_vpp (absolute floor) AND
+    >= consistency_frac * previous accepted v_pp. The absolute floor prevents a
+    first misfire (no B-mode pulse between frames) from collapsing the baseline
+    to near-zero, which would let all subsequent misfires pass the 2/3 check.
+    Rejected captures do NOT update the baseline.
 
     If max_attempts is reached with fewer than min_n valid captures but at least
     one, logs a warning and returns the best available. Returns None only if zero
@@ -281,6 +284,11 @@ def _multi_capture(scope, trig_lev, pre, min_n, max_attempts,
             continue
 
         vpp = stats["v_pp"]
+
+        # Absolute floor — rejects noise/between-frame captures regardless of baseline.
+        if vpp < min_signal_vpp:
+            rejected += 1
+            continue
 
         if prev_vpp is not None and vpp < consistency_frac * prev_vpp:
             rejected += 1
@@ -393,6 +401,15 @@ def run_scan(cfg, motor, scope, msg_q, stop_event):
                     motor.wait_for_done(stop_event=stop_event)
                     msg_q.put({"type": "log", "text": f"Z at {z}."})
 
+                if cfg.get("auto_delay_z") and cfg.get("speed_of_sound", 0) > 0:
+                    z_m       = z / cfg["z_spmm"] / 1000.0
+                    z_start_m = cfg["z_start"] / cfg["z_spmm"] / 1000.0
+                    new_delay = cfg["scope_delay"] + (z_m - z_start_m) / cfg["speed_of_sound"]
+                    scope.write(f":TIM:OFFS {new_delay:.9f}")
+                    msg_q.put({"type": "log", "text":
+                        f"  Z delay → {new_delay*1e6:.2f} µs"
+                        f"  (Δz={( z_m - z_start_m)*1000:.1f} mm)"})
+
                 for y in y_positions:
                     if stop_event.is_set():
                         break
@@ -424,7 +441,7 @@ def run_scan(cfg, motor, scope, msg_q, stop_event):
                                                      stop_event=stop_event, timeout=2.0)
                             if pilot is not None:
                                 pilot_vpp = pilot["v_pp"]
-                                new_vdiv  = max(_best_vdiv(pilot_vpp), 0.050)
+                                new_vdiv  = max(_best_vdiv(pilot_vpp), cfg.get("vdiv_floor", 0.050))
                                 cur_vdiv  = float(cfg["scope_vdiv"])
                                 # Always scale up (prevents clipping).
                                 # Only scale down if pilot looks like a real signal
@@ -449,6 +466,7 @@ def run_scan(cfg, motor, scope, msg_q, stop_event):
                             max_attempts=cfg["max_attempts"],
                             consistency_frac=cfg["consistency_frac"],
                             msg_q=msg_q, stop_event=stop_event,
+                            min_signal_vpp=cfg.get("min_signal_vpp", 0.0),
                         )
                         if stats is None:
                             if stop_event.is_set():
@@ -632,6 +650,10 @@ class ScanApp(tk.Tk):
         self._consist     = tk.StringVar(value="0.67")
         self._autoscale_vdiv  = tk.BooleanVar(value=True)
         self._as_min_vpp      = tk.StringVar(value="0.10")
+        self._vdiv_floor      = tk.StringVar(value="0.050")
+        self._min_sig_vpp     = tk.StringVar(value="0.02")
+        self._auto_delay_z    = tk.BooleanVar(value=True)
+        self._sos             = tk.StringVar(value="1500")
 
         _sc_combo(sc, 0, 0, "Mode",         self._sc_mode,     ["MAIN","XY","ROLL"])
         _sc_entry(sc, 0, 1, "s/div",         self._sc_sdiv)
@@ -654,10 +676,17 @@ class ScanApp(tk.Tk):
         ttk.Checkbutton(sc, text="Auto V/div", variable=self._autoscale_vdiv).grid(
             row=4, column=0, columnspan=2, sticky="w", padx=(8, 2), pady=3)
         _sc_entry(sc, 4, 1, "Min Vpp to scale down (V)", self._as_min_vpp, width=6)
+        _sc_entry(sc, 4, 2, "Min signal Vpp (V)",        self._min_sig_vpp, width=6)
+        _sc_entry(sc, 4, 3, "V/div floor (V)",           self._vdiv_floor,  width=6)
+
+        # Z delay row
+        ttk.Checkbutton(sc, text="Auto delay with Z", variable=self._auto_delay_z).grid(
+            row=5, column=0, columnspan=2, sticky="w", padx=(8, 2), pady=3)
+        _sc_entry(sc, 5, 1, "Speed of sound (m/s)", self._sos, width=6)
 
         self._apply_scope_btn = ttk.Button(sc, text="Apply Now",
                                            command=self._apply_scope_cfg, state="disabled")
-        self._apply_scope_btn.grid(row=5, column=0, columnspan=6, pady=(2, 4))
+        self._apply_scope_btn.grid(row=6, column=0, columnspan=6, pady=(2, 4))
 
         # ── Output ───────────────────────────────────────────────────────── #
         out = ttk.LabelFrame(self, text="Output")
@@ -825,6 +854,10 @@ class ScanApp(tk.Tk):
             "consistency_frac":  f(self._consist),
             "autoscale_vdiv":    self._autoscale_vdiv.get(),
             "autoscale_min_vpp": f(self._as_min_vpp),
+            "vdiv_floor":        f(self._vdiv_floor),
+            "min_signal_vpp":    f(self._min_sig_vpp),
+            "auto_delay_z":      self._auto_delay_z.get(),
+            "speed_of_sound":    f(self._sos),
         }
 
     def _connect(self):
