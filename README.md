@@ -66,4 +66,40 @@ The capture button essentially runs a single on the scope. The run button is run
 After taking a capture, the save button can be clicked to save it. Additionally, information on the wave is displayed in the window. Pii is based on the hydrophone calibration file stored in the same directory as the executable, called data.txt.
 
 
+### ScanGUIMulti.exe
+
+As expected. the Scan program combines the previous two programs, and is the most overcomplicated. We will go through it step by step.
+
+<img width="1114" height="1595" alt="Screenshot 2026-05-14 105246" src="https://github.com/user-attachments/assets/2d7ce924-b6b4-476f-b831-93ddfc15b39c" />
+
+The top two boxes are the motor and scope ports. These work the same as in motor control and scopegui. The next line is the channel that will be scoped for measurements.
+
+The next line is the step to mm ratio for the lab.
+
+The next line is configuration for the motor controller, and should not be modified unless the motor controller is modified.
+
+On the left, motor numbers can be assigned to directions. This will also likely not change if the motor controller setup does not change. Speed can be kept at the default value. Settle is the time that the program waits after motor movement to request a scope read. This is useful for reducing remnant waves from motor movement.
+
+The right is the setup for the scan grid. For any axis where the range is 0, the center will be ignored. Otherwise, the center, range, and step size can be configured.
+
+In the Scope Config box, the first two lines function the same as they do in ScanGUI with the exception being that this config is automatically applied when a scan is started. Scienftific notation can be used for these values.
+
+The third line is also standard and carried over from scanGUI. Remember to look at the trigger configuration.
+
+The fourth line begins unique features. The reason this program is called "multi", is because it's designed to take multiple waveforms at each point and choose the highest. The first box is the minimum number of waveforms at a point. The second box is the maximum number of waveforms at a point. For one capture at each point, set both to 1. The third box is consistency, and serves to validate the data coming in, and ensure it's not drastically different from the data adjacent to it.
+
+The fifth line relates to automatic scaling of V/div. This setting is highly reccomended, as waves can clip otherwise. The checkbox turns it on. Minimum vpp to scale down refers to the smallest wave seen that can reduce the vpp. This setting is intended to stop overly small waves from reducing the vpp too far and lead to clipping on the next point. The next box is minimum signal vpp. This refers to the minimum signal that is accepted as a valid capture. This setting ties directly into the minimum and maximum number of captures from the line before. If no wave is found, the point is skipped. 
+
+The final line is auto delay with Z. This is needed for Z scans, and autodelays the scope as z changes. Speed of water can be adjusted if the temperature of the water affects the acoustic speed.
+
+
+Data is stored as a csv in the location selected on the next line.
+
+The next area functions identically to how it does in MotorControlGUI. First click connect, then online, then start scan. The stop button currently does not work. To abort a scan, close the program.
+
+
+The final section is a mini version of MotorControlGUI. This allows the motor to be positioned in the same program as the scan.
+
+
+
 
