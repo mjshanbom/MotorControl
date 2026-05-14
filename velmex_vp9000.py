@@ -95,6 +95,10 @@ class VP9000:
             time.sleep(0.5)
         raise RuntimeError(f"VP9000 did not come online (last status: {last_status!r})")
 
+    def disable_online_mode(self):
+        """Return the controller to local (manual) mode."""
+        self.send("Q")
+
     def stop(self):
         """Kill all motion immediately."""
         self.send("K")

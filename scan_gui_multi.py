@@ -345,6 +345,26 @@ def run_connect(cfg, msg_q):
         msg_q.put({"type": "connect_error", "text": str(exc)})
 
 
+# ── Jog worker ───────────────────────────────────────────────────────────── #
+
+def run_jog(motor, motor_num, steps, speed, stop_event, msg_q):
+    try:
+        msg_q.put({"type": "log", "text": "Jog: going online…"})
+        motor.enable_online_mode()
+        motor.set_speed(motor_num, speed)
+        motor.move_relative(motor_num, steps)
+        motor.wait_for_done(stop_event=stop_event)
+        msg_q.put({"type": "jog_done", "motor": motor_num, "steps": steps})
+    except Exception as exc:
+        msg_q.put({"type": "jog_error", "text": str(exc)})
+    finally:
+        try:
+            motor.disable_online_mode()
+            msg_q.put({"type": "log", "text": "Jog: offline."})
+        except Exception:
+            pass
+
+
 # ── Scan thread ───────────────────────────────────────────────────────────── #
 
 def run_scan(cfg, motor, scope, msg_q, stop_event):
@@ -352,6 +372,10 @@ def run_scan(cfg, motor, scope, msg_q, stop_event):
     global _first_capture
     _first_capture = True
     try:
+        msg_q.put({"type": "log", "text": "Going online…"})
+        motor.enable_online_mode()
+        msg_q.put({"type": "log", "text": "Online."})
+
         motor.set_speed(cfg["x_motor"], cfg["speed"])
         motor.set_speed(cfg["y_motor"], cfg["speed"])
         motor.set_speed(cfg["z_motor"], cfg["speed"])
@@ -523,6 +547,13 @@ def run_scan(cfg, motor, scope, msg_q, stop_event):
     except Exception as exc:
         msg_q.put({"type": "error", "text": str(exc)})
 
+    finally:
+        try:
+            motor.disable_online_mode()
+            msg_q.put({"type": "log", "text": "Motor offline."})
+        except Exception:
+            pass
+
 
 # ── GUI ──────────────────────────────────────────────────────────────────── #
 
@@ -537,6 +568,9 @@ class ScanApp(tk.Tk):
         self._thread   = None
         self._motor    = None
         self._scope    = None
+        self._jog_moving   = False
+        self._jog_stop_evt = threading.Event()
+        self._jog_pos      = {1: 0, 2: 0, 3: 0, 4: 0}  # motor_num → steps
 
         self._build_ui()
         self._poll()
@@ -723,6 +757,104 @@ class ScanApp(tk.Tk):
         self._start_btn.pack(side="left", padx=6)
         self._stop_btn  = ttk.Button(btn, text="Stop", command=self._stop, state="disabled")
         self._stop_btn.pack(side="left", padx=6)
+
+        # ── Jog Controls ─────────────────────────────────────────────────── #
+        jog = ttk.LabelFrame(self, text="Jog Controls")
+        jog.grid(row=8, column=0, columnspan=2, sticky="ew", **pad)
+
+        ttk.Label(jog, text="Jog speed (steps/s)").grid(
+            row=0, column=0, columnspan=2, sticky="w", padx=(8, 4), pady=(4, 2))
+        self._jog_spd = tk.StringVar(value="500")
+        ttk.Entry(jog, textvariable=self._jog_spd, width=8).grid(
+            row=0, column=2, sticky="w", padx=(0, 8), pady=(4, 2))
+
+        for col, header in enumerate(["Axis", "Step (mm)", "Position (mm)", "", "", ""]):
+            ttk.Label(jog, text=header, font=("", 9, "bold")).grid(
+                row=1, column=col, padx=6, pady=(2, 0))
+
+        self._jog_widgets = []
+        for i, (label, default_step) in enumerate([("X", "1.0"), ("Y", "1.0"), ("Z", "0.25")]):
+            row = i + 2
+            ttk.Label(jog, text=label, width=3).grid(row=row, column=0, padx=6, pady=3)
+
+            step_var = tk.StringVar(value=default_step)
+            ttk.Entry(jog, textvariable=step_var, width=7).grid(row=row, column=1, padx=4)
+
+            pos_var = tk.StringVar(value="0.000")
+            ttk.Label(jog, textvariable=pos_var, width=10,
+                      relief="sunken", anchor="e").grid(row=row, column=2, padx=6)
+
+            neg_btn = ttk.Button(jog, text="  −  ", width=4,
+                                 command=lambda idx=i: self._jog(idx, -1))
+            neg_btn.grid(row=row, column=3, padx=2)
+            pos_btn = ttk.Button(jog, text="  +  ", width=4,
+                                 command=lambda idx=i: self._jog(idx, +1))
+            pos_btn.grid(row=row, column=4, padx=2)
+            zero_btn = ttk.Button(jog, text="Zero",
+                                  command=lambda idx=i: self._jog_zero(idx))
+            zero_btn.grid(row=row, column=5, padx=(4, 8))
+
+            self._jog_widgets.append({
+                "step": step_var, "pos": pos_var,
+                "neg": neg_btn, "pos_btn": pos_btn, "zero": zero_btn,
+            })
+
+        self._jog_stop_btn = ttk.Button(jog, text="Stop Jog", command=self._jog_stop)
+        self._jog_stop_btn.grid(row=5, column=0, columnspan=6, pady=(2, 6))
+
+        self._set_jog_state("disabled")
+
+    # ── Jog ──────────────────────────────────────────────────────────────── #
+
+    def _set_jog_state(self, state):
+        for w in self._jog_widgets:
+            w["neg"].config(state=state)
+            w["pos_btn"].config(state=state)
+            w["zero"].config(state=state)
+        self._jog_stop_btn.config(state="disabled")
+
+    def _jog_motor_num(self, axis_idx):
+        return int([self._xm, self._ym, self._zm][axis_idx].get())
+
+    def _jog(self, axis_idx, direction):
+        if self._jog_moving or self._motor is None:
+            return
+        w = self._jog_widgets[axis_idx]
+        try:
+            step_mm = float(w["step"].get())
+        except ValueError:
+            self._log_line("Invalid jog step size.")
+            return
+        lab_spmm = {"Optics Lab (160 steps/mm)": 160, "Acoustics Lab (200 steps/mm)": 200}
+        spmm = lab_spmm[self._lab.get()]
+        try:
+            speed = int(self._jog_spd.get())
+        except ValueError:
+            speed = 500
+        motor_num = self._jog_motor_num(axis_idx)
+        steps = int(round(direction * step_mm * spmm))
+        self._jog_moving = True
+        self._set_jog_state("disabled")
+        self._jog_stop_btn.config(state="normal")
+        self._jog_stop_evt.clear()
+        threading.Thread(target=run_jog,
+                         args=(self._motor, motor_num, steps, speed,
+                               self._jog_stop_evt, self._msg_q),
+                         daemon=True).start()
+
+    def _jog_zero(self, axis_idx):
+        motor_num = self._jog_motor_num(axis_idx)
+        self._jog_pos[motor_num] = 0
+        self._jog_widgets[axis_idx]["pos"].set("0.000")
+
+    def _jog_stop(self):
+        self._jog_stop_evt.set()
+        if self._motor:
+            try:
+                self._motor.send("K")
+            except Exception:
+                pass
+        self._jog_stop_btn.config(state="disabled")
 
     def _find_port(self):
         ports = [p.device for p in serial.tools.list_ports.comports()]
@@ -935,6 +1067,7 @@ class ScanApp(tk.Tk):
         self._start_btn.config(state="disabled")
         self._disconnect_btn.config(state="disabled")
         self._stop_btn.config(state="normal")
+        self._set_jog_state("disabled")
         self._thread = threading.Thread(
             target=run_scan,
             args=(cfg, self._motor, self._scope, self._msg_q, self._stop_evt),
@@ -962,13 +1095,17 @@ class ScanApp(tk.Tk):
                     self._scope = msg["scope"]
                     self._connect_btn.config(state="disabled")
                     self._disconnect_btn.config(state="normal")
-                    self._online_btn.config(state="normal")
                     self._apply_scope_btn.config(state="normal")
-                    self._status_var.set("Connected. Click Online to enable the controller.")
+                    self._start_btn.config(state="normal")
+                    self._set_jog_state("normal")
+                    self._status_var.set(
+                        "Connected. Motor is offline — zero it now if needed, "
+                        "then Start Scan or Jog.")
 
                 elif t == "online":
                     self._online_btn.config(state="disabled")
                     self._start_btn.config(state="normal")
+                    self._set_jog_state("normal")
                     self._status_var.set("Controller online. Ready to scan.")
                     self._log_line("Controller online. Ready.")
 
@@ -1000,6 +1137,7 @@ class ScanApp(tk.Tk):
                     self._start_btn.config(state="normal")
                     self._disconnect_btn.config(state="normal")
                     self._stop_btn.config(state="disabled")
+                    self._set_jog_state("normal")
 
                 elif t == "error":
                     self._log_line(f"ERROR: {msg['text']}")
@@ -1008,6 +1146,24 @@ class ScanApp(tk.Tk):
                     self._disconnect_btn.config(state="normal")
                     self._stop_btn.config(state="disabled")
                     self._online_btn.config(state="normal")
+                    self._set_jog_state("normal")
+
+                elif t == "jog_done":
+                    motor_num = msg["motor"]
+                    self._jog_pos[motor_num] += msg["steps"]
+                    lab_spmm = {"Optics Lab (160 steps/mm)": 160, "Acoustics Lab (200 steps/mm)": 200}
+                    spmm = lab_spmm[self._lab.get()]
+                    for i, m_var in enumerate([self._xm, self._ym, self._zm]):
+                        if int(m_var.get()) == motor_num:
+                            mm = self._jog_pos[motor_num] / spmm
+                            self._jog_widgets[i]["pos"].set(f"{mm:.3f}")
+                    self._jog_moving = False
+                    self._set_jog_state("normal")
+
+                elif t == "jog_error":
+                    self._log_line(f"Jog error: {msg['text']}")
+                    self._jog_moving = False
+                    self._set_jog_state("normal")
 
         except queue.Empty:
             pass
