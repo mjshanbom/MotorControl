@@ -101,5 +101,14 @@ The next area functions identically to how it does in MotorControlGUI. First cli
 The final section is a mini version of MotorControlGUI. This allows the motor to be positioned in the same program as the scan.
 
 
+### ScanGUI.exe
+
+The final program is ScanGUI.exe. This program does mostly work and is more simple than the ScanGUIMulti. However, it lacks some essential features such as v/div scaling.
+
+
+
+## Hydrophone Data
+
+Hydrophone data should be stored in the same directory as the programs in a file called data.txt
 
 
