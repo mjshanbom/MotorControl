@@ -46,3 +46,24 @@ Step size
 The next section is the jog configuration. The motor assigned to each direction likely does not need to be changed unless the motor controller is reconfigured. Step size, in mm, can be stored and used for each motor using the + and - buttons. The position box is only accurate for changes in position made by the program, and does not sync to the controller. To that end, the home button is currently bugged and should not be used.
 
 To start, press Connect, then Online. Currently the stop button is non functional.
+
+
+### ScopeGUI.exe
+
+ScopeGUI acts as a way to read the RIGOL DS1102 Z-E oscilloscope. Ensure the scope is connected to the PC over USB and on.
+
+
+<img width="1708" height="1066" alt="Screenshot 2026-05-14 103338" src="https://github.com/user-attachments/assets/ecf5778e-441f-4c1a-95d9-d7b41f8a6aa9" />
+
+Let's walk through this image. Similar to MotorControlGUI, there is a find button to identify the VISA for the scope. This VISA will be very obvious to indetify. Afterwards, click connect.
+
+The first box is the channel box. This allows you to choose which channel to measure from. Note, the program allows for four channels, but our current scope only has two.
+
+The next section is scope config. This allows you to configure the scope on the computer rather than on the scope. Note, this config only applies when clicking apply config, and does not apply when clicking capture. This can be useful if you want to modify the configuration directly from the scope, and only use the program to capture. The waveform can then be saved. The saved document starts with "quick information on the wave," then continues to points formatted the same as the existing labview program.
+
+The capture button essentially runs a single on the scope. The run button is run on the scope and stop stops.
+
+After taking a capture, the save button can be clicked to save it. Additionally, information on the wave is displayed in the window. Pii is based on the hydrophone calibration file stored in the same directory as the executable, called data.txt.
+
+
+
